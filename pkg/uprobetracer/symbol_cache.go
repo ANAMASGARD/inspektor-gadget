@@ -169,8 +169,11 @@ func (c *symbolCache) resolve(file *os.File, name string) (uint64, error) {
 	return result.offset(name)
 }
 
-// Match cilium/ebpf v0.22's ordinary-symbol lookup, including dynamic table
-// precedence, zero-address rejection and executable segment translation.
+// parseOrdinarySymbol matches cilium/ebpf v0.22's ordinary-symbol lookup,
+// including dynamic table precedence, zero-address rejection and executable
+// segment translation. It streams the tables instead of materializing them
+// (see symbol_stream.go): memory use is bounded by a few fixed-size buffers
+// and does not depend on the binary's symbol count.
 func parseOrdinarySymbol(file *os.File, name string) (result symbolResult, err error) {
 	// debug/elf may panic on malformed input; cilium's SafeELFFile likewise
 	// converts such panics to errors. They must never populate the negative cache.
@@ -187,26 +190,14 @@ func parseOrdinarySymbol(file *os.File, name string) (result symbolResult, err e
 	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
 		return result, fmt.Errorf("the given file is not an executable or a shared object")
 	}
-	for _, read := range []func() ([]elf.Symbol, error){f.Symbols, f.DynamicSymbols} {
-		symbols, readErr := read()
-		if readErr != nil && !errors.Is(readErr, elf.ErrNoSymbols) {
-			return symbolResult{}, readErr
-		}
-		for _, s := range symbols {
-			if s.Name != name || elf.ST_TYPE(s.Info) != elf.STT_FUNC {
-				continue
-			}
-			address := s.Value
-			for _, p := range f.Progs {
-				if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 && p.Vaddr <= s.Value && s.Value < p.Vaddr+p.Memsz {
-					address = s.Value - p.Vaddr + p.Off
-					break
-				}
-			}
-			result = symbolResult{found: true, address: address, size: s.Size}
+	scanner := newSymbolScanner(f, name)
+	defer scanner.release()
+	for _, typ := range []elf.SectionType{elf.SHT_SYMTAB, elf.SHT_DYNSYM} {
+		if err := scanner.scan(typ); err != nil && !errors.Is(err, elf.ErrNoSymbols) {
+			return symbolResult{}, err
 		}
 	}
-	return result, nil
+	return scanner.result, nil
 }
 
 // bindOrdinarySites keeps custom offsets intact and resolves ordinary names
