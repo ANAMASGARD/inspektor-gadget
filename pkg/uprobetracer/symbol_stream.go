@@ -34,17 +34,35 @@ import (
 // candidate name against the string table in place. It never builds a string
 // per symbol, so its allocation does not depend on the symbol count.
 //
+// The string table is reached in one of two ways. A table of at most
+// wholeStringTableMax bytes is read whole, once per table, into a pooled buffer.
+// A larger one is read through a small sliding window instead.
+//
+// The window only pays off when consecutive function symbols name nearby
+// strings. The Go linker writes .symtab and .strtab in the same order, so on a
+// Go binary (whose tables are the large ones) the window moves forward and a
+// refill is rare. GNU ld output does not have that property: .dynsym is in
+// GNU-hash order and .dynstr/.strtab are suffix-merged, so nearly every symbol
+// lands outside the window and would cost one window-sized read. Those tables
+// are small (libcrypto.so.3's .dynstr is well under the cap), so reading them
+// whole avoids the problem.
+//
 // The result must stay identical to the debug/elf based lookup it replaces
 // (kept as the oracle in symbol_stream_test.go), so the rules below are the
 // ones debug/elf applies, including its oddities.
 const (
 	// symbolChunkSize is the largest slice of a symbol table read at once.
 	symbolChunkSize = 64 << 10
-	// nameWindowSize is the string-table window kept in memory. Symbol tables
-	// list names in roughly ascending string-table order, so one window serves
-	// many consecutive symbols and a refill is rare.
+	// nameWindowSize is the sliding window used for a string table larger than
+	// wholeStringTableMax.
 	nameWindowSize = 16 << 10
+	// wholeStringTableMax is the largest string table read whole.
+	wholeStringTableMax = 1 << 20
 )
+
+// wholeStringTableLimit is wholeStringTableMax, lowered only by tests so that
+// small fixtures also exercise the sliding window.
+var wholeStringTableLimit uint64 = wholeStringTableMax
 
 // scanBuffers are the only per-lookup allocations that scale with anything, and
 // they are fixed-size, so they are pooled.
@@ -53,7 +71,13 @@ type scanBuffers struct {
 	window  [nameWindowSize]byte
 }
 
-var scanBufferPool = sync.Pool{New: func() any { return new(scanBuffers) }}
+var (
+	scanBufferPool = sync.Pool{New: func() any { return new(scanBuffers) }}
+	// wholeTablePool holds the buffers for string tables read whole. They are
+	// taken only when a table fits, so a lookup on a large Go binary never
+	// touches one.
+	wholeTablePool = sync.Pool{New: func() any { return new([wholeStringTableMax]byte) }}
+)
 
 // tableView is random access to the uncompressed bytes of one ELF section.
 type tableView struct {
@@ -92,10 +116,11 @@ func (v tableView) readFull(p []byte, off uint64) error {
 }
 
 // stringTable answers "is the NUL-terminated string at this offset equal to
-// name" through a sliding window, without ever building the string.
+// name" without ever building the string. Its window is either the whole table
+// (start 0, filled = size, so at never refills) or a fixed-size sliding window.
 type stringTable struct {
 	view   tableView
-	window []byte // backing buffer, fixed size
+	window []byte // backing buffer
 	start  uint64 // string-table offset of window[0]
 	filled int    // valid bytes in window
 }
@@ -167,6 +192,7 @@ type symbolScanner struct {
 	// decoded name stops at its first NUL, so a name containing one never matches.
 	matchable bool
 	bufs      *scanBuffers
+	whole     *[wholeStringTableMax]byte // taken on first use, nil until then
 	strings   stringTable
 	result    symbolResult
 }
@@ -178,6 +204,10 @@ func newSymbolScanner(f *elf.File, name string) *symbolScanner {
 func (s *symbolScanner) release() {
 	scanBufferPool.Put(s.bufs)
 	s.bufs = nil
+	if s.whole != nil {
+		wholeTablePool.Put(s.whole)
+		s.whole = nil
+	}
 }
 
 // scan folds every matching function symbol of the first section of type typ
@@ -218,16 +248,9 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 	if err != nil {
 		return fmt.Errorf("cannot load string table section: %w", err)
 	}
-	// The old lookup read the whole string table up front, so a truncated one
-	// failed even when no name was ever looked up. Reading the last byte proves
-	// the whole range is present, without reading the rest.
-	if strtab.size > 0 {
-		var last [1]byte
-		if err := strtab.readFull(last[:], strtab.size-1); err != nil {
-			return fmt.Errorf("cannot load string table section: %w", err)
-		}
+	if err := s.loadStrings(strtab); err != nil {
+		return fmt.Errorf("cannot load string table section: %w", err)
 	}
-	s.strings = stringTable{view: strtab, window: s.bufs.window[:]}
 
 	chunk := uint64(len(s.bufs.entries)) / entSize * entSize
 	skip := true // the first entry is the all-zero null symbol
@@ -248,6 +271,31 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 			}
 		}
 	}
+	return nil
+}
+
+// loadStrings prepares s.strings for strtab. The old lookup read the whole
+// string table up front, so a truncated one failed even when no name was ever
+// looked up; both branches below fail the same way.
+func (s *symbolScanner) loadStrings(strtab tableView) error {
+	if strtab.size <= wholeStringTableLimit {
+		if s.whole == nil {
+			s.whole = wholeTablePool.Get().(*[wholeStringTableMax]byte)
+		}
+		data := s.whole[:strtab.size]
+		if err := strtab.readFull(data, 0); err != nil {
+			return err
+		}
+		s.strings = stringTable{view: strtab, window: data, filled: len(data)}
+		return nil
+	}
+	// Reading the last byte proves the whole range is present, without reading
+	// the rest.
+	var last [1]byte
+	if err := strtab.readFull(last[:], strtab.size-1); err != nil {
+		return err
+	}
+	s.strings = stringTable{view: strtab, window: s.bufs.window[:]}
 	return nil
 }
 

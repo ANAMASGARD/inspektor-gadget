@@ -20,10 +20,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -287,9 +289,36 @@ func putUint(t testing.TB, data []byte, class elf.Class, at int, wide bool, valu
 	binary.LittleEndian.PutUint32(data[at:], uint32(value))
 }
 
+// stringTableModes runs a test once per way of reaching the string table. The
+// fixtures are small, so by default they take the whole-table path; "window"
+// forces the sliding window that large Go binaries use.
+var stringTableModes = []struct {
+	name  string
+	limit uint64
+}{
+	{"whole", wholeStringTableMax},
+	{"window", 0},
+}
+
+func forEachStringTableMode(t *testing.T, test func(t *testing.T)) {
+	for _, mode := range stringTableModes {
+		t.Run(mode.name, func(t *testing.T) {
+			saved := wholeStringTableLimit
+			wholeStringTableLimit = mode.limit
+			t.Cleanup(func() { wholeStringTableLimit = saved })
+			test(t)
+		})
+	}
+}
+
 // Crafted and corrupted files: the streaming lookup must agree with the oracle
-// on both the answer and on whether the file is rejected.
+// on both the answer and on whether the file is rejected, through both string
+// table paths.
 func TestParseOrdinarySymbolMatchesMaterializedOnMalformedFiles(t *testing.T) {
+	forEachStringTableMode(t, checkMalformedFiles)
+}
+
+func checkMalformedFiles(t *testing.T) {
 	static, dynamic := fixtureSymbols()
 	for _, class := range []elf.Class{elf.ELFCLASS32, elf.ELFCLASS64} {
 		base := readAll(t, symbolFixture(t, class, elf.ET_DYN, static, dynamic))
@@ -468,7 +497,7 @@ func TestParseOrdinarySymbolIgnoresCorruptVersionTables(t *testing.T) {
 		}
 	}
 	if verneed == nil {
-		t.Skip("no corpus file with GNU version-need tables")
+		skipOffLinux(t, "no corpus file with GNU version-need tables")
 	}
 	// vn_version must be 1; debug/elf rejects anything else.
 	corrupt := bytes.Clone(data)
@@ -484,6 +513,16 @@ func TestParseOrdinarySymbolIgnoresCorruptVersionTables(t *testing.T) {
 	require.True(t, got.found)
 	t.Logf("oracle on corrupt version table: %v", oracleErr)
 	require.Error(t, oracleErr, "the oracle is expected to reject this file")
+}
+
+// skipOffLinux skips a test whose corpus is missing, except on Linux, where the
+// system C library is always in the corpus and a missing file is a real failure.
+func skipOffLinux(t *testing.T, reason string) {
+	t.Helper()
+	if runtime.GOOS == "linux" {
+		t.Fatal(reason)
+	}
+	t.Skip(reason)
 }
 
 // Pooled buffers must never be shared between concurrent lookups.
@@ -502,7 +541,7 @@ func TestParseOrdinarySymbolConcurrent(t *testing.T) {
 		}
 	}
 	if file == nil {
-		t.Skip("no corpus file with symbols")
+		skipOffLinux(t, "no corpus file with symbols")
 	}
 	var err error
 	names := funcs
@@ -534,6 +573,10 @@ func TestParseOrdinarySymbolConcurrent(t *testing.T) {
 // A name with a very long string must work through the windowed reader: a name
 // longer than the window is compared in several pieces.
 func TestParseOrdinarySymbolNameLongerThanWindow(t *testing.T) {
+	forEachStringTableMode(t, checkNameLongerThanWindow)
+}
+
+func checkNameLongerThanWindow(t *testing.T) {
 	long := strings.Repeat("abcdefghij", nameWindowSize/10*3) // 3 windows
 	static := []elf.Symbol{
 		{Name: "pad", Info: byte(elf.STT_FUNC), Value: 0x1010, Size: 1},
@@ -604,6 +647,10 @@ func bigStringsFixture(t testing.TB, class elf.Class, symbols []elf.Symbol) *os.
 // A symbol table larger than one chunk, with the match in the last chunk and
 // again in the first, must still honour last-match-wins and read every entry.
 func TestParseOrdinarySymbolSpansChunks(t *testing.T) {
+	forEachStringTableMode(t, checkSpansChunks)
+}
+
+func checkSpansChunks(t *testing.T) {
 	var symbols []elf.Symbol
 	count := 3 * symbolChunkSize / 16 // several chunks even for 32-bit entries
 	for i := range count {
@@ -658,5 +705,129 @@ func BenchmarkOrdinarySymbolLookup(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// shuffledStringsFixture is an ELF64 shared object with n function symbols in
+// .dynsym whose names sit in .dynstr in a random order, the shape GNU ld gives
+// (GNU-hash symbol order, suffix-merged strings). Names are 38 bytes, so the
+// string table is about 39*n bytes.
+func shuffledStringsFixture(t testing.TB, n int) *os.File {
+	t.Helper()
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("OPENSSL_some_long_function_name_%06d", i)
+	}
+	strs := []byte{0}
+	offs := make([]uint32, n)
+	for _, i := range rand.New(rand.NewSource(1)).Perm(n) {
+		offs[i] = uint32(len(strs))
+		strs = append(strs, names[i]...)
+		strs = append(strs, 0)
+	}
+	var table bytes.Buffer
+	table.Write(make([]byte, elf.Sym64Size))
+	for i := range names {
+		require.NoError(t, binary.Write(&table, binary.LittleEndian, elf.Sym64{Name: offs[i], Info: byte(elf.STT_FUNC), Value: 0x1000 + uint64(i), Size: 1, Shndx: 1}))
+	}
+	const headersAt = 128
+	stringsAt := 1024
+	symtabAt := stringsAt + len(strs)
+	data := make([]byte, symtabAt+table.Len())
+	copy(data[stringsAt:], strs)
+	copy(data[symtabAt:], table.Bytes())
+	put := func(at int, v any) {
+		var out bytes.Buffer
+		require.NoError(t, binary.Write(&out, binary.LittleEndian, v))
+		copy(data[at:], out.Bytes())
+	}
+	ident := [16]byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)}
+	put(0, elf.Header64{Ident: ident, Type: uint16(elf.ET_DYN), Machine: uint16(elf.EM_X86_64), Version: 1, Phoff: 64, Shoff: headersAt, Ehsize: 64, Phentsize: 56, Phnum: 1, Shentsize: 64, Shnum: 3})
+	put(64, elf.Prog64{Type: uint32(elf.PT_LOAD), Flags: uint32(elf.PF_X), Memsz: 0x100000})
+	put(headersAt+64, elf.Section64{Type: uint32(elf.SHT_STRTAB), Off: uint64(stringsAt), Size: uint64(len(strs))})
+	put(headersAt+128, elf.Section64{Type: uint32(elf.SHT_DYNSYM), Off: uint64(symtabAt), Size: uint64(table.Len()), Link: 1, Entsize: elf.Sym64Size})
+	f, err := os.CreateTemp(t.TempDir(), "shuffled")
+	require.NoError(t, err)
+	_, err = f.Write(data)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+// countingReader counts the reads that reach the file.
+type countingReader struct {
+	r     io.ReaderAt
+	calls int
+	bytes int
+}
+
+func (c *countingReader) ReadAt(p []byte, off int64) (int, error) {
+	c.calls++
+	c.bytes += len(p)
+	return c.r.ReadAt(p, off)
+}
+
+// scanCounting runs the same scan as parseOrdinarySymbol over a counting reader.
+func scanCounting(t testing.TB, file *os.File, name string) (symbolResult, *countingReader) {
+	t.Helper()
+	c := &countingReader{r: file}
+	f, err := elf.NewFile(c)
+	require.NoError(t, err)
+	scanner := newSymbolScanner(f, name)
+	defer scanner.release()
+	for _, typ := range []elf.SectionType{elf.SHT_SYMTAB, elf.SHT_DYNSYM} {
+		if err := scanner.scan(typ); err != nil && !errors.Is(err, elf.ErrNoSymbols) {
+			require.NoError(t, err)
+		}
+	}
+	return scanner.result, c
+}
+
+// A string table in random order must not cost one read per symbol. Below the
+// whole-table cap it is read once, so the read count follows the symbol-table
+// chunks, not the symbol count.
+func TestParseOrdinarySymbolShuffledStringsReadCount(t *testing.T) {
+	const n = 20000 // about 780 KB of strings, under the cap
+	file := shuffledStringsFixture(t, n)
+	for _, name := range []string{"absent_name_here_xx", "OPENSSL_some_long_function_name_000123", "OPENSSL_some_long_function_name_019999"} {
+		requireSameLookup(t, file, name)
+	}
+	result, reads := scanCounting(t, file, "absent_name_here_xx")
+	require.False(t, result.found)
+	symtabChunks := (n+1)*elf.Sym64Size/symbolChunkSize + 1
+	t.Logf("whole table: %d reads, %d bytes", reads.calls, reads.bytes)
+	// ELF headers, the string table once, the symbol table in chunks.
+	require.LessOrEqual(t, reads.calls, symtabChunks+16)
+
+	saved := wholeStringTableLimit
+	wholeStringTableLimit = 0
+	defer func() { wholeStringTableLimit = saved }()
+	_, windowReads := scanCounting(t, file, "absent_name_here_xx")
+	t.Logf("sliding window: %d reads, %d bytes", windowReads.calls, windowReads.bytes)
+}
+
+// The cost of a lookup on a GNU-ld shaped table (see shuffledStringsFixture),
+// streaming against the oracle, with the reads per lookup reported.
+func BenchmarkOrdinarySymbolShuffledStrings(b *testing.B) {
+	for _, n := range []int{5000, 25000} {
+		file := shuffledStringsFixture(b, n)
+		for _, lookup := range []struct {
+			impl string
+			fn   func(*os.File, string) (symbolResult, error)
+		}{
+			{"oracle", parseOrdinarySymbolMaterialized},
+			{"streaming", parseOrdinarySymbol},
+		} {
+			b.Run(fmt.Sprintf("%s/n=%d", lookup.impl, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, err := lookup.fn(file, "absent_name_here_xx"); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+		_, reads := scanCounting(b, file, "absent_name_here_xx")
+		b.Logf("n=%d: streaming reads per lookup=%d bytes=%d", n, reads.calls, reads.bytes)
 	}
 }
