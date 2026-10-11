@@ -210,6 +210,9 @@ func TestParseOrdinarySymbolMatchesMaterializedOnRealBinaries(t *testing.T) {
 			// includes the first and last names of the sorted list. Setting
 			// SYMSTREAM_FULL=1 checks every name, each against the oracle.
 			limit, oracleNames := 400, 20
+			if raceEnabled {
+				limit = 60
+			}
 			if full {
 				limit = len(funcs)
 			}
