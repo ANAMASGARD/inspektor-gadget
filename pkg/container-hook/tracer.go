@@ -263,10 +263,28 @@ func (n *ContainerNotifier) CallbackStats() CallbackStats {
 	}
 }
 
+var configuredCallbackHardBound atomic.Int64
+
+// SetAddContainerCallbackHardBound sets the create-to-start wait budget. It must
+// be called before starting container collection. The five-second ceiling keeps
+// container starts bounded even when enrichment permanently stalls.
+func SetAddContainerCallbackHardBound(budget time.Duration) error {
+	if budget <= 0 || budget > 5*time.Second {
+		return fmt.Errorf("container callback budget must be in (0, 5s]: %s", budget)
+	}
+	configuredCallbackHardBound.Store(int64(budget))
+	return nil
+}
+
 // AddContainerCallbackHardBound exposes the guardrail's latency bound so an
 // embedder's budget can be expressed relative to it ("p99 under half the
 // bound") instead of duplicating the constant and silently drifting from it.
-func AddContainerCallbackHardBound() time.Duration { return addContainerCallbackHardBound }
+func AddContainerCallbackHardBound() time.Duration {
+	if budget := configuredCallbackHardBound.Load(); budget != 0 {
+		return time.Duration(budget)
+	}
+	return addContainerCallbackHardBound
+}
 
 var runtimePaths []string = append(
 	runtimefinder.RuntimePaths,
@@ -665,17 +683,20 @@ func (n *ContainerNotifier) callbackAddContainerBounded(event ContainerEvent) {
 	// required; the trip point is intentionally fuzzy.)
 	if n.cbInFlight.Load() > addContainerCallbackTripThreshold {
 		n.cbBreaches.Add(1)
-		log.Warnf("container-hook: %d AddContainer callbacks in flight (> %d); failing open immediately to keep container starts flowing (breaches=%d)",
-			n.cbInFlight.Load(), addContainerCallbackTripThreshold, n.cbBreaches.Load())
+		recordCallbackFailOpen("in_flight")
+		log.Warnf("container-hook: %d AddContainer callbacks in flight (> %d); failing open immediately to keep container starts flowing (breaches=%d, container=%s, pid=%d)",
+			n.cbInFlight.Load(), addContainerCallbackTripThreshold, n.cbBreaches.Load(), event.ContainerID, event.ContainerPID)
 		return
 	}
 
+	budget := AddContainerCallbackHardBound()
 	select {
 	case <-done:
-	case <-time.After(addContainerCallbackHardBound):
+	case <-time.After(budget):
 		n.cbBreaches.Add(1)
-		log.Warnf("container-hook: AddContainer callback exceeded %s (in-flight=%d, breaches=%d); allowing container start (fail-open)",
-			addContainerCallbackHardBound, n.cbInFlight.Load(), n.cbBreaches.Load())
+		recordCallbackFailOpen("timeout")
+		log.Warnf("container-hook: AddContainer callback exceeded %s (in-flight=%d, breaches=%d); allowing container start (fail-open, container=%s, pid=%d)",
+			budget, n.cbInFlight.Load(), n.cbBreaches.Load(), event.ContainerID, event.ContainerPID)
 	}
 }
 
