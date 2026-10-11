@@ -18,8 +18,9 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/stretchr/testify/require"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 )
 
 func TestReleaseBoundsPayloadRetention(t *testing.T) {
@@ -106,7 +107,8 @@ func TestDeepCopyOwnershipAcrossRelease(t *testing.T) {
 			// empty payloads, without assuming sync.Pool returns any specific object.
 			for _, payload := range [][][]byte{
 				{bytes.Repeat([]byte{0x42}, 18*1024), []byte("metadata")},
-				{[]byte("small")}, nil,
+				{[]byte("small")},
+				nil,
 				{[]byte("again"), nil, []byte("last")},
 			} {
 				elem := &dataElement{Payload: payload}
