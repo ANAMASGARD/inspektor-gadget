@@ -862,6 +862,34 @@ func (ds *dataSource) DeepCopy(source Data) Data {
 	}
 }
 
+// Limit idle retention per pooled element while keeping small field buffers reusable.
+// The slot limit also bounds the retained slice-header array (768 bytes on amd64).
+const (
+	maxRetainedPayloadBytes = 4 * 1024
+	maxRetainedPayloadSlots = 32
+)
+
+func (d *dataElement) releasePayload() {
+	if cap(d.Payload) > maxRetainedPayloadSlots {
+		d.Payload = nil
+		return
+	}
+
+	// deepCopyInto can shrink the payload without clearing its unused slots.
+	// Those slots must not keep buffers from a previous, larger event alive.
+	clear(d.Payload[len(d.Payload):cap(d.Payload)])
+	remaining := maxRetainedPayloadBytes
+	for i, buffer := range d.Payload {
+		if cap(buffer) > remaining {
+			d.Payload[i] = nil
+			continue
+		}
+		remaining -= cap(buffer)
+		d.Payload[i] = buffer[:0]
+	}
+	d.Payload = d.Payload[:0]
+}
+
 // Release returns a Packet or Data to the pool for reuse.
 // The instance MUST NOT be used after calling Release.
 func (ds *dataSource) Release(item interface{}) {
@@ -869,8 +897,8 @@ func (ds *dataSource) Release(item interface{}) {
 	case *data:
 		if v.Data != nil {
 			elem := (*dataElement)(v.Data)
-			// Keep payload slices for reuse - don't set to nil to reduce GC pressure
-			elem.Payload = elem.Payload[:0]
+			// Retain only bounded, reusable field buffers.
+			elem.releasePayload()
 			ds.dataElementPool.Put(elem)
 			v.Data = nil
 		}
@@ -878,14 +906,14 @@ func (ds *dataSource) Release(item interface{}) {
 		v.Seq = 0
 		ds.dataPool.Put(v)
 	case *dataElement:
-		// Keep payload slices for reuse - don't set to nil to reduce GC pressure
-		v.Payload = v.Payload[:0]
+		// Retain only bounded, reusable field buffers.
+		v.releasePayload()
 		ds.dataElementPool.Put(v)
 	case *dataArray:
 		// Release all elements in the array
 		for _, elem := range v.DataArray {
 			dataElem := (*dataElement)(elem)
-			// Keep payload slices for reuse - don't set to nil to reduce GC pressure
+			// Drop payload references before pooling the wrapper.
 			dataElem.Payload = nil
 			ds.dataElementPool.Put(dataElem)
 		}
