@@ -170,12 +170,47 @@ func TestParseOrdinarySymbolMatchesMaterializedOnRealBinaries(t *testing.T) {
 			funcs, others := symbolNamesOf(ef)
 			t.Logf("%s: class=%v order=%v type=%v function names=%d other names=%d", path, ef.Class, ef.ByteOrder, ef.Type, len(funcs), len(others))
 
-			// The oracle is slow on a big binary (it re-materializes all symbols
-			// per call), so large inputs are sampled: a deterministic stride that
-			// always includes the first and last names of the sorted list. Setting
-			// SYMSTREAM_FULL=1 checks every name.
-			limit := 400
-			if os.Getenv("SYMSTREAM_FULL") != "" {
+			// Expected result for every name, from one pass over the materialized
+			// tables with the oracle's own rules (last match wins, dynamic table
+			// last). A name absent from the map expects "not found". The oracle
+			// re-materializes every symbol per call, which on a large binary costs
+			// a tenth of a second or more, so it is called for a spread-out subset
+			// only; that subset also proves the map agrees with the oracle.
+			want := map[string]symbolResult{}
+			for _, read := range []func() ([]elf.Symbol, error){ef.Symbols, ef.DynamicSymbols} {
+				symbols, _ := read()
+				for _, s := range symbols {
+					if elf.ST_TYPE(s.Info) != elf.STT_FUNC {
+						continue
+					}
+					address := s.Value
+					for _, p := range ef.Progs {
+						if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 && p.Vaddr <= s.Value && s.Value < p.Vaddr+p.Memsz {
+							address = s.Value - p.Vaddr + p.Off
+							break
+						}
+					}
+					want[s.Name] = symbolResult{found: true, address: address, size: s.Size}
+				}
+			}
+			full := os.Getenv("SYMSTREAM_FULL") != ""
+			oracleChecks := 0
+			check := func(name string, withOracle bool) {
+				t.Helper()
+				if withOracle || full {
+					oracleChecks++
+					requireSameLookup(t, file, name)
+				}
+				got, err := parseOrdinarySymbol(file, name)
+				require.NoError(t, err, name)
+				require.Equal(t, want[name], got, "name %q", name)
+			}
+
+			// Large inputs are sampled: a deterministic stride that always
+			// includes the first and last names of the sorted list. Setting
+			// SYMSTREAM_FULL=1 checks every name, each against the oracle.
+			limit, oracleNames := 400, 20
+			if full {
 				limit = len(funcs)
 			}
 			var sample []string
@@ -186,51 +221,33 @@ func TestParseOrdinarySymbolMatchesMaterializedOnRealBinaries(t *testing.T) {
 					sample = append(sample, funcs[i*(len(funcs)-1)/(limit-1)])
 				}
 			}
-			for _, name := range sample {
-				requireSameLookup(t, file, name)
-				// Prefixes, suffixes and near misses of real names: each must match
-				// the oracle (almost always "absent"), never a longer or shorter name.
+			oracleEvery := max(1, len(sample)/oracleNames)
+			for i, name := range sample {
+				withOracle := i%oracleEvery == 0 || i == len(sample)-1
+				check(name, withOracle)
+				// Prefixes, suffixes and near misses of real names: each must give
+				// the expected result (almost always "absent"), never a longer or
+				// shorter name.
 				if len(name) > 1 {
-					requireSameLookup(t, file, name[:len(name)-1])
-					requireSameLookup(t, file, name[1:])
+					check(name[:len(name)-1], withOracle)
+					check(name[1:], withOracle)
 				}
-				requireSameLookup(t, file, name+"x")
-				requireSameLookup(t, file, name+"\x00")
-				requireSameLookup(t, file, "x"+name)
+				check(name+"x", withOracle)
+				check(name+"\x00", withOracle)
+				check("x"+name, withOracle)
 			}
 			for i := 0; i < len(others) && i < 40; i++ {
-				requireSameLookup(t, file, others[i*max(1, len(others)/40)%len(others)])
+				check(others[i*max(1, len(others)/40)%len(others)], i%4 == 0)
 			}
 			for _, name := range []string{"", "\x00", "absent_uprobe_symbol", strings.Repeat("a", 5000), "SSL_read", "SSL_write", "malloc", "main.main", "runtime.main"} {
-				requireSameLookup(t, file, name)
+				check(name, true)
 			}
+			t.Logf("%d oracle comparisons", oracleChecks)
 
-			// Independent expectation for every function name: a single pass over
-			// the materialized tables with the oracle's own rules (last match wins,
-			// dynamic table last). This is the "all names" check without paying one
-			// oracle call per name; it is itself validated by the sampled calls above.
-			if len(funcs) <= 3000 || os.Getenv("SYMSTREAM_FULL") != "" {
-				want := map[string]symbolResult{}
-				for _, read := range []func() ([]elf.Symbol, error){ef.Symbols, ef.DynamicSymbols} {
-					symbols, _ := read()
-					for _, s := range symbols {
-						if elf.ST_TYPE(s.Info) != elf.STT_FUNC {
-							continue
-						}
-						address := s.Value
-						for _, p := range ef.Progs {
-							if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 && p.Vaddr <= s.Value && s.Value < p.Vaddr+p.Memsz {
-								address = s.Value - p.Vaddr + p.Off
-								break
-							}
-						}
-						want[s.Name] = symbolResult{found: true, address: address, size: s.Size}
-					}
-				}
+			// Every function name, where that is cheap enough.
+			if len(funcs) <= 3000 || full {
 				for _, name := range funcs {
-					got, err := parseOrdinarySymbol(file, name)
-					require.NoError(t, err, name)
-					require.Equal(t, want[name], got, name)
+					check(name, false)
 				}
 			}
 		})
@@ -289,31 +306,25 @@ func putUint(t testing.TB, data []byte, class elf.Class, at int, wide bool, valu
 	binary.LittleEndian.PutUint32(data[at:], uint32(value))
 }
 
-// stringTableModes runs a test once per way of reaching the string table. The
-// fixtures are small, so by default they take the whole-table path; "window"
-// forces the sliding window that large Go binaries use.
-var stringTableModes = []struct {
-	name  string
-	limit uint64
-}{
-	{"whole", wholeStringTableMax},
-	{"window", 0},
-}
-
+// forEachStringTableMode runs a test with the normal string-table search chunk
+// and with the smallest one, where nearly every name crosses a chunk border.
 func forEachStringTableMode(t *testing.T, test func(t *testing.T)) {
-	for _, mode := range stringTableModes {
+	for _, mode := range []struct {
+		name  string
+		chunk int
+	}{{"one chunk", symbolChunkSize}, {"tiny chunks", 1}} {
 		t.Run(mode.name, func(t *testing.T) {
-			saved := wholeStringTableLimit
-			wholeStringTableLimit = mode.limit
-			t.Cleanup(func() { wholeStringTableLimit = saved })
+			saved := stringSearchChunk
+			stringSearchChunk = mode.chunk
+			t.Cleanup(func() { stringSearchChunk = saved })
 			test(t)
 		})
 	}
 }
 
 // Crafted and corrupted files: the streaming lookup must agree with the oracle
-// on both the answer and on whether the file is rejected, through both string
-// table paths.
+// on both the answer and on whether the file is rejected, whatever the search
+// chunk size.
 func TestParseOrdinarySymbolMatchesMaterializedOnMalformedFiles(t *testing.T) {
 	forEachStringTableMode(t, checkMalformedFiles)
 }
@@ -783,27 +794,26 @@ func scanCounting(t testing.TB, file *os.File, name string) (symbolResult, *coun
 	return scanner.result, c
 }
 
-// A string table in random order must not cost one read per symbol. Below the
-// whole-table cap it is read once, so the read count follows the symbol-table
-// chunks, not the symbol count.
+// A string table in random order must not cost one read per symbol: both
+// tables are read once, in chunks, so the read count follows the table sizes,
+// not the symbol count.
 func TestParseOrdinarySymbolShuffledStringsReadCount(t *testing.T) {
-	const n = 20000 // about 780 KB of strings, under the cap
+	const n = 40000 // about 1.5 MB of strings and 960 KB of symbols
 	file := shuffledStringsFixture(t, n)
-	for _, name := range []string{"absent_name_here_xx", "OPENSSL_some_long_function_name_000123", "OPENSSL_some_long_function_name_019999"} {
+	for _, name := range []string{"absent_name_here_xx", "OPENSSL_some_long_function_name_000123", "OPENSSL_some_long_function_name_039999", "name_000123"} {
 		requireSameLookup(t, file, name)
 	}
-	result, reads := scanCounting(t, file, "absent_name_here_xx")
-	require.False(t, result.found)
-	symtabChunks := (n+1)*elf.Sym64Size/symbolChunkSize + 1
-	t.Logf("whole table: %d reads, %d bytes", reads.calls, reads.bytes)
-	// ELF headers, the string table once, the symbol table in chunks.
-	require.LessOrEqual(t, reads.calls, symtabChunks+16)
-
-	saved := wholeStringTableLimit
-	wholeStringTableLimit = 0
-	defer func() { wholeStringTableLimit = saved }()
-	_, windowReads := scanCounting(t, file, "absent_name_here_xx")
-	t.Logf("sliding window: %d reads, %d bytes", windowReads.calls, windowReads.bytes)
+	for _, name := range []string{"absent_name_here_xx", "OPENSSL_some_long_function_name_000123"} {
+		result, reads := scanCounting(t, file, name)
+		require.Equal(t, name != "absent_name_here_xx", result.found)
+		info, err := file.Stat()
+		require.NoError(t, err)
+		chunks := int(info.Size())/(symbolChunkSize-len(name)) + 2
+		t.Logf("%q: %d reads, %d bytes, file %d bytes", name, reads.calls, reads.bytes, info.Size())
+		// ELF headers, then each table once, in chunks.
+		require.LessOrEqual(t, reads.calls, chunks+16)
+		require.Less(t, reads.bytes, 2*int(info.Size()))
+	}
 }
 
 // The cost of a lookup on a GNU-ld shaped table (see shuffledStringsFixture),

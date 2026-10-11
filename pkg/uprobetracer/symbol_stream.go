@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -29,40 +30,41 @@ import (
 // debug/elf's Symbols and DynamicSymbols build a []elf.Symbol with one Go
 // string per symbol, plus a copy of the symbol table and of the string table.
 // On a large Go binary that is tens of megabytes of garbage to find one name,
-// and every distinct probed name repeats it. The scanner below reads the symbol
-// table in fixed-size chunks and, for each function symbol, compares the
-// candidate name against the string table in place. It never builds a string
-// per symbol, so its allocation does not depend on the symbol count.
+// and every distinct probed name repeats it. The scanner below never builds a
+// string per symbol, so its allocation does not depend on the symbol count.
 //
-// The string table is reached in one of two ways. A table of at most
-// wholeStringTableMax bytes is read whole, once per table, into a pooled buffer.
-// A larger one is read through a small sliding window instead.
+// It reads the string table once, front to back in fixed-size chunks, and
+// records every offset at which the wanted name followed by a NUL starts. That
+// includes offsets inside a longer string, because linkers merge suffixes (a
+// symbol "bar" may point into "foobar"). It then reads the symbol table in
+// fixed-size chunks, and a function symbol matches when its name offset is one
+// of the recorded offsets. Both tables are read sequentially and once, whatever
+// order the linker wrote them in.
 //
-// The window only pays off when consecutive function symbols name nearby
-// strings. The Go linker writes .symtab and .strtab in the same order, so on a
-// Go binary (whose tables are the large ones) the window moves forward and a
-// refill is rare. GNU ld output does not have that property: .dynsym is in
-// GNU-hash order and .dynstr/.strtab are suffix-merged, so nearly every symbol
-// lands outside the window and would cost one window-sized read. Those tables
-// are small (libcrypto.so.3's .dynstr is well under the cap), so reading them
-// whole avoids the problem.
+// Comparing each symbol's name in place through a small window would be cheap
+// only when symbols and strings are in the same order. Internally linked Go
+// binaries have that order; GNU ld output (.dynsym in GNU-hash order,
+// suffix-merged .dynstr) and externally linked Go binaries do not, and there
+// such a window costs about one read per function symbol.
+//
+// The empty name still uses the window: debug/elf also decodes an offset
+// outside the table or an unterminated string as "", which a search for a NUL
+// cannot express, and no probe asks for "".
 //
 // The result must stay identical to the debug/elf based lookup it replaces
 // (kept as the oracle in symbol_stream_test.go), so the rules below are the
 // ones debug/elf applies, including its oddities.
 const (
-	// symbolChunkSize is the largest slice of a symbol table read at once.
+	// symbolChunkSize is the largest slice of a symbol table, or of a string
+	// table being searched, read at once.
 	symbolChunkSize = 64 << 10
-	// nameWindowSize is the sliding window used for a string table larger than
-	// wholeStringTableMax.
+	// nameWindowSize is the string-table window used for the empty name.
 	nameWindowSize = 16 << 10
-	// wholeStringTableMax is the largest string table read whole.
-	wholeStringTableMax = 1 << 20
 )
 
-// wholeStringTableLimit is wholeStringTableMax, lowered only by tests so that
-// small fixtures also exercise the sliding window.
-var wholeStringTableLimit uint64 = wholeStringTableMax
+// stringSearchChunk is the chunk size of the string-table search. It is
+// symbolChunkSize, lowered only by tests so that names straddle chunk borders.
+var stringSearchChunk = symbolChunkSize
 
 // scanBuffers are the only per-lookup allocations that scale with anything, and
 // they are fixed-size, so they are pooled.
@@ -71,13 +73,7 @@ type scanBuffers struct {
 	window  [nameWindowSize]byte
 }
 
-var (
-	scanBufferPool = sync.Pool{New: func() any { return new(scanBuffers) }}
-	// wholeTablePool holds the buffers for string tables read whole. They are
-	// taken only when a table fits, so a lookup on a large Go binary never
-	// touches one.
-	wholeTablePool = sync.Pool{New: func() any { return new([wholeStringTableMax]byte) }}
-)
+var scanBufferPool = sync.Pool{New: func() any { return new(scanBuffers) }}
 
 // tableView is random access to the uncompressed bytes of one ELF section.
 type tableView struct {
@@ -115,14 +111,49 @@ func (v tableView) readFull(p []byte, off uint64) error {
 	return err
 }
 
-// stringTable answers "is the NUL-terminated string at this offset equal to
-// name" without ever building the string. Its window is either the whole table
-// (start 0, filled = size, so at never refills) or a fixed-size sliding window.
+// stringTable knows where the wanted name occurs in one string table
+// (offsets), or, for the empty name, answers through a sliding window.
 type stringTable struct {
-	view   tableView
-	window []byte // backing buffer
-	start  uint64 // string-table offset of window[0]
-	filled int    // valid bytes in window
+	view    tableView
+	offsets []uint64 // ascending offsets of name+NUL
+	window  []byte   // backing buffer, fixed size
+	start   uint64   // string-table offset of window[0]
+	filled  int      // valid bytes in window
+}
+
+// find records in t.offsets every offset at which pattern (a name and its NUL)
+// starts, reading the table front to back in chunks of buf. Consecutive chunks
+// overlap by len(pattern)-1 bytes, so an occurrence across a border is found
+// once. Two occurrences never overlap, because the name holds no NUL. buf must
+// be longer than pattern.
+func (t *stringTable) find(pattern, buf []byte) error {
+	m := uint64(len(pattern))
+	for pos := uint64(0); pos < t.view.size; {
+		n := min(uint64(len(buf)), t.view.size-pos)
+		chunk := buf[:n]
+		if err := t.view.readFull(chunk, pos); err != nil {
+			return err
+		}
+		for i := 0; ; {
+			j := bytes.Index(chunk[i:], pattern)
+			if j < 0 {
+				break
+			}
+			t.offsets = append(t.offsets, pos+uint64(i+j))
+			i += j + len(pattern)
+		}
+		if pos+n == t.view.size {
+			break
+		}
+		pos += n - (m - 1)
+	}
+	return nil
+}
+
+// has reports whether the string at off is exactly the wanted name.
+func (t *stringTable) has(off uint64) bool {
+	_, found := slices.BinarySearch(t.offsets, off)
+	return found
 }
 
 // at returns the bytes from pos to the end of the window, refilling the window
@@ -138,31 +169,6 @@ func (t *stringTable) at(pos uint64) ([]byte, error) {
 	}
 	t.start, t.filled = pos, int(n)
 	return t.window[:n], nil
-}
-
-// equals reports whether the string at off is exactly name, terminated by a NUL
-// inside the table. name must not contain a NUL and must not be empty.
-func (t *stringTable) equals(off uint64, name string) (bool, error) {
-	need := uint64(len(name)) + 1
-	if off >= t.view.size || t.view.size-off < need {
-		return false, nil
-	}
-	for done := uint64(0); done < uint64(len(name)); {
-		w, err := t.at(off + done)
-		if err != nil {
-			return false, err
-		}
-		n := min(uint64(len(w)), uint64(len(name))-done)
-		if string(w[:n]) != name[done:done+n] {
-			return false, nil
-		}
-		done += n
-	}
-	w, err := t.at(off + uint64(len(name)))
-	if err != nil {
-		return false, err
-	}
-	return w[0] == 0, nil
 }
 
 // isEmpty reports whether debug/elf would decode the name at off as "". That is
@@ -191,23 +197,20 @@ type symbolScanner struct {
 	// matchable is false for a name that debug/elf could never produce: a
 	// decoded name stops at its first NUL, so a name containing one never matches.
 	matchable bool
-	bufs      *scanBuffers
-	whole     *[wholeStringTableMax]byte // taken on first use, nil until then
-	strings   stringTable
-	result    symbolResult
+	// pattern is name followed by a NUL, the bytes searched for.
+	pattern []byte
+	bufs    *scanBuffers
+	strings stringTable
+	result  symbolResult
 }
 
 func newSymbolScanner(f *elf.File, name string) *symbolScanner {
-	return &symbolScanner{f: f, name: name, matchable: strings.IndexByte(name, 0) < 0, bufs: scanBufferPool.Get().(*scanBuffers)}
+	return &symbolScanner{f: f, name: name, matchable: strings.IndexByte(name, 0) < 0, pattern: append([]byte(name), 0), bufs: scanBufferPool.Get().(*scanBuffers)}
 }
 
 func (s *symbolScanner) release() {
 	scanBufferPool.Put(s.bufs)
 	s.bufs = nil
-	if s.whole != nil {
-		wholeTablePool.Put(s.whole)
-		s.whole = nil
-	}
 }
 
 // scan folds every matching function symbol of the first section of type typ
@@ -278,24 +281,22 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 // string table up front, so a truncated one failed even when no name was ever
 // looked up; both branches below fail the same way.
 func (s *symbolScanner) loadStrings(strtab tableView) error {
-	if strtab.size <= wholeStringTableLimit {
-		if s.whole == nil {
-			s.whole = wholeTablePool.Get().(*[wholeStringTableMax]byte)
+	s.strings = stringTable{view: strtab, offsets: s.strings.offsets[:0], window: s.bufs.window[:]}
+	if s.matchable && s.name != "" {
+		buf := s.bufs.entries[:min(stringSearchChunk, len(s.bufs.entries))]
+		if need := 2 * len(s.pattern); len(buf) < need {
+			buf = make([]byte, need) // only for a name longer than half a chunk
 		}
-		data := s.whole[:strtab.size]
-		if err := strtab.readFull(data, 0); err != nil {
-			return err
-		}
-		s.strings = stringTable{view: strtab, window: data, filled: len(data)}
-		return nil
+		return s.strings.find(s.pattern, buf)
 	}
 	// Reading the last byte proves the whole range is present, without reading
 	// the rest.
-	var last [1]byte
-	if err := strtab.readFull(last[:], strtab.size-1); err != nil {
-		return err
+	if strtab.size > 0 {
+		var last [1]byte
+		if err := strtab.readFull(last[:], strtab.size-1); err != nil {
+			return err
+		}
 	}
-	s.strings = stringTable{view: strtab, window: s.bufs.window[:]}
 	return nil
 }
 
@@ -334,7 +335,7 @@ func (s *symbolScanner) visit(entry []byte) error {
 	case s.name == "":
 		match, err = s.strings.isEmpty(nameOff)
 	default:
-		match, err = s.strings.equals(nameOff, s.name)
+		match = s.strings.has(nameOff)
 	}
 	if err != nil {
 		return fmt.Errorf("cannot load string table section: %w", err)
