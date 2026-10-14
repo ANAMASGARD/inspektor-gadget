@@ -896,6 +896,7 @@ func (f *lateMappedLibHandler) ReattachContainerMappedLibsPid(_ uint32, pid uint
 	}
 	return nil
 }
+
 func TestMappedLibTimerDiscoversLaterLibraryAfterSuccess(t *testing.T) {
 	for _, laterPID := range []bool{false, true} {
 		name := "same_pid"
@@ -934,6 +935,7 @@ func TestMappedLibTimerDiscoversLaterLibraryAfterSuccess(t *testing.T) {
 		})
 	}
 }
+
 func TestFanOutMappedLibPassScansEveryPIDAfterSuccess(t *testing.T) {
 	f := &lateMappedLibHandler{available: map[uint32][]string{200: {"libA"}, 201: {"libB"}}, attached: map[string]bool{}}
 	fanOutMappedLibPass(map[string]mappedLibHandler{"ssl": f}, 100, []uint32{200, 201}, nil, time.Now().Add(time.Hour), func(uint32, error) {})
