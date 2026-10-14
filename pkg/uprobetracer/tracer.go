@@ -1424,6 +1424,11 @@ type mappedOpen struct {
 // the pid that actually executed can reveal it. Bookkeeping (the commit,
 // containerPid2Inodes, mappedLibAttached) stays credited to containerPid.
 func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid, execPid uint32, pattern *regexp.Regexp) ([]mappedOpen, error) {
+	return t.discoverAndOpenMappedLibrariesInNamespace(containerPid, execPid, pattern, 0)
+}
+
+// A nonzero snapshotMntns must survive discovery and map_files opening unchanged.
+func (t *Tracer[Event]) discoverAndOpenMappedLibrariesInNamespace(containerPid, execPid uint32, pattern *regexp.Regexp, snapshotMntns uint64) ([]mappedOpen, error) {
 	// Capture the mount namespace BEFORE walking maps so we can pass it to
 	// openMapFile for the post-open PID-recycle validation.
 	expectedMntns, err := readProcMntns(execPid)
@@ -1443,6 +1448,13 @@ func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid, execPid uin
 			return nil, nil
 		}
 		expectedMntns = containerMntns
+	}
+
+	if snapshotMntns != 0 {
+		if !startupNamespaceMatches(containerPid, execPid, snapshotMntns) {
+			return nil, nil
+		}
+		expectedMntns = snapshotMntns
 	}
 
 	libs, err := discoverMappedLibraries(execPid, pattern)
@@ -1542,6 +1554,11 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 // opened. They are equal for a container whose tracked process is the workload,
 // and diverge whenever the workload runs as a forked child.
 func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid, execPid uint32, pattern *regexp.Regexp) error {
+	return t.reattachContainerMappedLibsPid(containerPid, execPid, pattern, 0)
+}
+
+// Startup callers retain their snapshot namespace across both I/O and commit.
+func (t *Tracer[Event]) reattachContainerMappedLibsPid(containerPid, execPid uint32, pattern *regexp.Regexp, snapshotMntns uint64) error {
 	if pattern == nil {
 		return nil
 	}
@@ -1565,7 +1582,7 @@ func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid, execPid uin
 	t.mu.Unlock()
 
 	// Phase 1 (NO lock): discover + open the map_files candidates.
-	opened, err := t.discoverAndOpenMappedLibraries(containerPid, execPid, pattern)
+	opened, err := t.discoverAndOpenMappedLibrariesInNamespace(containerPid, execPid, pattern, snapshotMntns)
 	if err != nil {
 		closeMappedOpen(opened) // empty today (error precedes the open loop); defensive against future partial-result edits
 		return err
@@ -1580,6 +1597,10 @@ func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid, execPid uin
 		return nil
 	}
 	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		closeMappedOpen(opened)
+		return nil
+	}
+	if snapshotMntns != 0 && !startupNamespaceMatches(containerPid, execPid, snapshotMntns) {
 		closeMappedOpen(opened)
 		return nil
 	}
