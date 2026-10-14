@@ -301,3 +301,79 @@ func TestStartupExecutableRejectsNamespaceChange(t *testing.T) {
 		})
 	}
 }
+
+func TestStartupMappedLibraryRejectsRootNamespaceChangeDuringOpen(t *testing.T) {
+	proc := withFakeProcRoot(t)
+	selfExe, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeStartupProcess(t, proc, 100, "mnt:[1]", selfExe)
+	tr, st := newTestTracer(t)
+	st.openErr = os.ErrNotExist // only the mapped-file candidate may attach
+	tr.SetStartupMappedLibPattern(regexp.MustCompile(`^libssl\.so\.3$`))
+	line := buildMapsLine("7e8714023000-7e87141a3000", "r-xp", 100, "/custom/libssl.so.3")
+	if err := os.WriteFile(filepath.Join(proc, "100/maps"), []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr.openMapFileFunc = func(pid uint32, _ string, expected uint64) (*os.File, error) {
+		if pid != 100 || expected != 1 {
+			t.Fatalf("open pid=%d namespace=%d", pid, expected)
+		}
+		f, err := os.Open("/proc/self/exe")
+		if err != nil {
+			return nil, err
+		}
+		st.openFiles = append(st.openFiles, f)
+		st.currentInode = 42
+		ns := filepath.Join(proc, "100/ns/mnt")
+		if err := os.Remove(ns); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("mnt:[2]", ns); err != nil {
+			t.Fatal(err)
+		}
+		return f, nil
+	}
+	if err := tr.AttachContainer(settledTestContainer(100)); err != nil {
+		t.Fatal(err)
+	}
+	if st.attachCount != 0 || tr.HasMappedLibForPid(100) {
+		t.Fatal("startup attached a mapped inode after the root namespace changed")
+	}
+	for _, f := range st.openFiles {
+		if _, err := f.Stat(); err == nil {
+			t.Fatal("opened file leaked after namespace change")
+		}
+	}
+}
+
+func TestStartupMappedLibraryRejectsReusedRootBeforeOpen(t *testing.T) {
+	for _, execPid := range []uint32{100, 200} {
+		t.Run(fmt.Sprint(execPid), func(t *testing.T) {
+			proc := withFakeProcRoot(t)
+			fakeStartupProcess(t, proc, 100, "mnt:[2]", "/unrelated")
+			if execPid != 100 {
+				fakeStartupProcess(t, proc, execPid, "mnt:[2]", "/unrelated-child")
+			}
+			// The snapshot came from namespace 1; both live PIDs now share namespace 2.
+			// Comparing only the current root and child would incorrectly accept them.
+			line := buildMapsLine("7e8714023000-7e87141a3000", "r-xp", 100, "/custom/libssl.so.3")
+			if err := os.WriteFile(filepath.Join(proc, fmt.Sprint(execPid), "maps"), []byte(line+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tr, _ := newTestTracer(t)
+			tr.containerPid2Inodes[100] = nil
+			tr.openMapFileFunc = func(uint32, string, uint64) (*os.File, error) {
+				t.Fatal("opened mapping from recycled root namespace")
+				return nil, nil
+			}
+			if err := tr.reattachContainerMappedLibsPid(100, execPid, regexp.MustCompile(`^libssl\.so\.3$`), 1); err != nil {
+				t.Fatal(err)
+			}
+			if tr.HasMappedLibForPid(100) || len(tr.containerPid2Inodes[100]) != 0 {
+				t.Fatal("credited unrelated mapping")
+			}
+		})
+	}
+}

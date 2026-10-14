@@ -60,7 +60,7 @@ func (t *Tracer[Event]) attachExistingProcesses(containerPid uint32) {
 			t.logger.Infof("uprobetracer: startup discovery containerPid=%d reached time budget", containerPid)
 			break
 		}
-		if err := t.ReattachContainerMappedLibsPid(containerPid, pid, pattern); err != nil {
+		if err := t.reattachContainerMappedLibsPid(containerPid, pid, pattern, expectedMntns); err != nil {
 			t.logger.Debugf("startup mapped-library attach containerPid=%d pid=%d: %v", containerPid, pid, err)
 		}
 	}
@@ -131,7 +131,7 @@ func existingProcessPids(root uint32, deadline time.Time) []uint32 {
 	return pids
 }
 
-// Recheck both identities before executable resolution and before committing
+// Recheck both identities before startup attachment and before committing
 // opened files; a namespace change invalidates the startup snapshot.
 func startupNamespaceMatches(containerPid, pid uint32, expected uint64) bool {
 	containerNS, err := readProcMntns(containerPid)
