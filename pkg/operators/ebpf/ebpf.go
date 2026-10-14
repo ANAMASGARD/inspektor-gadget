@@ -364,6 +364,7 @@ func (i *ebpfInstance) newUprobeTracer(gadgetCtx operators.GadgetContext) (*upro
 	if err != nil {
 		return nil, fmt.Errorf("creating uprobe tracer: %w", err)
 	}
+	uprobeTracer.SetStartupMappedLibPattern(i.mappedLibPattern)
 	v, ok := gadgetCtx.GetVar(uprobetracer.AttachOffsetResolverVar)
 	if !ok {
 		return uprobeTracer, nil
