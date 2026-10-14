@@ -146,15 +146,9 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 // (never compiles+stores the empty-join "(?:)" ,  which would match every
 // string).
 //
-// KNOWN LIMITATION (mappedLibAttached coverage, see uprobetracer/tracer.go's
-// mappedLibAttached/HasMappedLibForPid): with N>1 registered patterns,
-// "attached" means "at least one of N matched" — the Phase-3 retry loop
-// (armMappedLibTimer) can stop for a pid once ANY registered pattern's library
-// is discovered, before a SECOND, later-mapped library (matching a different
-// registered pattern) is ever found. Unreachable today: netty-tcnative targets
-// the JVM and the AEAD runtime.node pattern targets Node.js — disjoint runtimes,
-// never co-mapped in the same container. Revisit if a third pattern is added, or
-// if two registered patterns can ever match within the same container.
+// HasMappedLibForPid reports only whether at least one library is attached.
+// Discovery therefore continues through the bounded scan window even after a
+// match, so a later mapping or exec can contribute additional libraries.
 var (
 	mappedLibPatternMu      sync.Mutex
 	mappedLibPatternSources []string
@@ -246,7 +240,7 @@ const mappedLibMaxTrackedPids = 64
 // Registry invariant: r.timers[cp] == e ⟹ exactly one live goroutine owns e. e
 // leaves the map only via cancel/cancelAll, or via that goroutine immediately
 // before it returns. A gen bump is guaranteed to be observed only on the retry
-// (cap-reached) path; the terminal paths — success, detach (<-stop), shutdown
+// (cap-reached) path; the terminal paths — detach (<-stop), shutdown
 // (<-i.done), ceiling — drop a racing bump deliberately, which is safe because
 // removal-then-return leaves the next arm() free to create a fresh entry rather
 // than dedup against a dead one. (This clause concerns the generation/
@@ -373,7 +367,7 @@ func (r *mappedLibTimerRegistry) arm(containerPid, execPid uint32) (*mappedLibTi
 
 // retire removes e from the registry unconditionally, identity-checked so a
 // newer entry installed by a concurrent arm() is never clobbered. Idempotent.
-// Called by the success, shutdown, and ceiling paths. NOT called by the detach
+// Called by the shutdown and ceiling paths. NOT called by the detach
 // (<-stop) path, since cancel() already removed the entry before closing stop;
 // NOT called by the cap-reached (retry) path, which uses rearmedOrRetire
 // instead.
@@ -433,9 +427,9 @@ func (r *mappedLibTimerRegistry) cancelAll() {
 }
 
 // armMappedLibTimer arms (once per containerPid) a bounded retry goroutine that
-// fans out ReattachContainerMappedLibsPid across i.uprobeTracers until any
-// tracer reports the library attached for that container (HasMappedLibForPid),
-// the attempt cap is hit, or the wall-clock ceiling expires. It is a no-op when
+// fans out ReattachContainerMappedLibsPid across i.uprobeTracers until the
+// attempt cap is hit or the wall-clock ceiling expires. Existing attachments
+// do not imply that libraries mapped later are covered. It is a no-op when
 // the feature is off (nil pattern).
 //
 // containerPid is the dedup/cancellation key; execPid is a pid whose procfs the
@@ -498,15 +492,13 @@ func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 				// "attempt %d" is relative to the CURRENT generation: after a
 				// budget reset a later pass can log a low attempt number.
 				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: attached on attempt %d", containerPid, attempt+1)
-				i.mappedLibTimers.retire(containerPid, entry) // path 1: success
-				return
 			}
 			if attempt+1 >= mappedLibRetryAttempts { // path 4: cap reached
 				if g, keep := i.mappedLibTimers.rearmedOrRetire(containerPid, entry, lastGen); keep {
 					lastGen, attempt = g, -1
 					continue
 				}
-				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: cap reached (%d attempts), giving up", containerPid, mappedLibRetryAttempts)
+				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: scan window complete (%d attempts)", containerPid, mappedLibRetryAttempts)
 				return
 			}
 			select {
@@ -544,8 +536,8 @@ type mappedLibHandler interface {
 // containerPid, scanning each of execPids' procfs, and reports whether the
 // targeted library is now attached on any tracer, alongside any candidates a
 // cheap liveness pre-check confirmed are gone (so the caller can prune them
-// from the tracked set). Re-scan is scoped to tracers that do NOT yet report
-// the lib for this container. deadline is the calling goroutine's own
+// from the tracked set). All tracers are re-scanned for newly mapped libraries.
+// deadline is the calling goroutine's own
 // wall-clock ceiling, used to bound how far a single pass can run past it.
 func (i *ebpfInstance) runMappedLibPass(containerPid uint32, execPids []uint32, pattern *regexp.Regexp, deadline time.Time) (anyAttached bool, deadPids []uint32) {
 	// Per-pass instrumentation: duration, containerPid and the FULL execPids
@@ -579,8 +571,10 @@ func (i *ebpfInstance) runMappedLibPass(containerPid uint32, execPids []uint32, 
 	return anyAttached, deadPids
 }
 
-// fanOutMappedLibPass calls ReattachContainerMappedLibsPid on every handler not
-// yet satisfied (HasMappedLibForPid), scanning live execPids for each in turn.
+// fanOutMappedLibPass calls ReattachContainerMappedLibsPid on every handler,
+// scanning live execPids for each in turn. Prior attachments do not skip a
+// handler or later PID: either can expose another library. The tracer
+// deduplicates already-attached inodes.
 //
 // deadline bounds how long a single handler's OWN execPid scan may run past
 // it -- NOT the whole fan-out. A resolver-backed handler (e.g. AEAD's, whose
@@ -608,7 +602,6 @@ func fanOutMappedLibPass(handlers map[string]mappedLibHandler, containerPid uint
 	for _, handler := range handlers {
 		if handler.HasMappedLibForPid(containerPid) {
 			anyAttached = true
-			continue
 		}
 		for _, execPid := range live {
 			if err := handler.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
@@ -616,7 +609,6 @@ func fanOutMappedLibPass(handlers map[string]mappedLibHandler, containerPid uint
 			}
 			if handler.HasMappedLibForPid(containerPid) {
 				anyAttached = true
-				break // this handler is satisfied; stop scanning further candidates FOR IT
 			}
 			if time.Now().After(deadline) {
 				break // this handler's budget is spent; move to the NEXT HANDLER so it still gets its own first attempt (see func doc)
