@@ -36,6 +36,10 @@ func (t *Tracer[Event]) attachExistingProcesses(containerPid uint32) {
 	t.mu.Lock()
 	pattern := t.startupMappedLibPattern
 	t.mu.Unlock()
+	expectedMntns, err := readProcMntns(containerPid)
+	if err != nil {
+		return
+	}
 	deadline := time.Now().Add(attachIOTimeout)
 	pids := existingProcessPids(containerPid, deadline)
 	if len(pids) == startupMaxProcesses {
@@ -48,7 +52,7 @@ func (t *Tracer[Event]) attachExistingProcesses(containerPid uint32) {
 		}
 		// The entrypoint executable was handled by attachContainerWork already.
 		if pid != containerPid {
-			if err := t.ReattachContainerExecPid(containerPid, pid); err != nil {
+			if err := t.reattachContainerExecPid(containerPid, pid, expectedMntns); err != nil {
 				t.logger.Debugf("startup executable attach containerPid=%d pid=%d: %v", containerPid, pid, err)
 			}
 		}
@@ -125,4 +129,15 @@ func existingProcessPids(root uint32, deadline time.Time) []uint32 {
 		}
 	}
 	return pids
+}
+
+// Recheck both identities before executable resolution and before committing
+// opened files; a namespace change invalidates the startup snapshot.
+func startupNamespaceMatches(containerPid, pid uint32, expected uint64) bool {
+	containerNS, err := readProcMntns(containerPid)
+	if err != nil || containerNS != expected {
+		return false
+	}
+	processNS, err := readProcMntns(pid)
+	return err == nil && processNS == expected
 }

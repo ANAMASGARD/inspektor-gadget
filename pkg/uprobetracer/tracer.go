@@ -1112,6 +1112,12 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 // logic stays correct across the create-time attach plus N re-attaches, no
 // matter how many distinct execPids fed into them.
 func (t *Tracer[Event]) ReattachContainerExecPid(containerPid, execPid uint32) error {
+	return t.reattachContainerExecPid(containerPid, execPid, 0)
+}
+
+// A nonzero expectedMntns pins startup reattachment to the namespace observed
+// before taking the descendant snapshot. Exec-event callers retain their path.
+func (t *Tracer[Event]) reattachContainerExecPid(containerPid, execPid uint32, expectedMntns uint64) error {
 	// Phase 0 (lock): cheap guards + snapshot the inputs the lock-free resolve
 	// needs. The heavy resolve/open I/O below MUST NOT run under t.mu: an exec
 	// storm holding the lock across it starves the create-time AttachContainer
@@ -1142,6 +1148,10 @@ func (t *Tracer[Event]) ReattachContainerExecPid(containerPid, execPid uint32) e
 	ociConfig := t.containerPid2OciConfig[containerPid]
 	progName := t.progName // snapshot for the metrics labels below; read-only after AttachProg
 	t.mu.Unlock()
+
+	if expectedMntns != 0 && !startupNamespaceMatches(containerPid, execPid, expectedMntns) {
+		return nil
+	}
 
 	// Phase 1 (NO lock): resolve + open the I/O-heavy attach targets.
 	//
@@ -1275,6 +1285,11 @@ func (t *Tracer[Event]) ReattachContainerExecPid(containerPid, execPid uint32) e
 		return nil
 	}
 	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		t.mu.Unlock()
+		closeOpened(opened)
+		return nil
+	}
+	if expectedMntns != 0 && !startupNamespaceMatches(containerPid, execPid, expectedMntns) {
 		t.mu.Unlock()
 		closeOpened(opened)
 		return nil

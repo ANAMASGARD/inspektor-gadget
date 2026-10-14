@@ -259,3 +259,45 @@ func TestStartupCloseJoinsAttachWorker(t *testing.T) {
 		t.Fatal("startup worker installed an inode after Close")
 	}
 }
+
+func TestStartupExecutableRejectsNamespaceChange(t *testing.T) {
+	for _, duringOpen := range []bool{false, true} {
+		t.Run(fmt.Sprint("duringOpen=", duringOpen), func(t *testing.T) {
+			proc := withFakeProcRoot(t)
+			fakeStartupProcess(t, proc, 100, "mnt:[1]", "/init", 200)
+			fakeStartupProcess(t, proc, 200, "mnt:[1]", "/client")
+			tr, st := newTestTracer(t)
+			tr.containerPid2Inodes[100] = nil
+			changeNS := func() {
+				ns := filepath.Join(proc, "200/ns/mnt")
+				if err := os.Remove(ns); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("mnt:[2]", ns); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if duringOpen {
+				tr.openInContainer = func(ctx context.Context, pid uint32, path string) (*os.File, error) {
+					if path == "/client" {
+						changeNS()
+					}
+					return st.open(ctx, pid, path)
+				}
+			} else {
+				changeNS()
+			}
+			if err := tr.reattachContainerExecPid(100, 200, 1); err != nil {
+				t.Fatal(err)
+			}
+			if st.attachCount != 0 {
+				t.Fatal("attached executable from changed namespace")
+			}
+			for _, f := range st.openFiles {
+				if _, err := f.Stat(); err == nil {
+					t.Fatal("opened file not closed on namespace race")
+				}
+			}
+		})
+	}
+}
