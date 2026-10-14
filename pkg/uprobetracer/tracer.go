@@ -1497,7 +1497,7 @@ func closeMappedOpen(opened []mappedOpen) {
 // commitMappedLibraries attaches each already-open map_files candidate under t.mu,
 // applying the standard readRealInode → inodeRefCount dedup → containerPid2Inodes
 // bookkeeping (via attachOneOpenFile, which consumes/closes every file) and marking
-// mappedLibAttached so HasMappedLibForPid can stop the retry loop. Caller holds t.mu
+// mappedLibAttached to report coverage of at least one inode. Caller holds t.mu
 // and has re-validated that containerPid is still tracked.
 func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mappedOpen) {
 	attachedRealInodes := t.containerPid2Inodes[containerPid]
@@ -1516,7 +1516,7 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 			existing[realInodePtr] = true
 			attachedRealInodes = append(attachedRealInodes, realInodePtr)
 			// Mark the pid as having a map_files-credited inode so HasMappedLibForPid
-			// reports success and the Phase-3 retry loop can stop. Set on a real
+			// reports coverage of at least one library. Set on a real
 			// attach OR a refcount bump (added==true), since either means the
 			// targeted library is now covered for this pid.
 			t.mappedLibAttached[containerPid] = true
@@ -1588,9 +1588,8 @@ func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid, execPid uin
 }
 
 // HasMappedLibForPid reports whether reattachMappedLibraries has already credited
-// at least one inode via the map_files path for containerPid. The Phase-3 retry
-// timer polls this to stop once the targeted library (e.g. netty-tcnative) is
-// attached, instead of running to the cap. It is lock-safe.
+// at least one inode via the map_files path for containerPid. This does not
+// establish coverage of other libraries mapped later. It is lock-safe.
 func (t *Tracer[Event]) HasMappedLibForPid(containerPid uint32) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

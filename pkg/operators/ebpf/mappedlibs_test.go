@@ -85,9 +85,8 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Fatalf("timeout waiting for: %s", msg)
 }
 
-// TestMappedLibTimerStopsOnSuccess: the timer fans out once, the pass reports
-// attached, the goroutine exits immediately and retires the pid.
-func TestMappedLibTimerStopsOnSuccess(t *testing.T) {
+// A successful pass must not stop discovery of libraries mapped later.
+func TestMappedLibTimerContinuesAfterSuccess(t *testing.T) {
 	shrinkBackoff(t)
 	var calls atomic.Int32
 	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
@@ -98,14 +97,14 @@ func TestMappedLibTimerStopsOnSuccess(t *testing.T) {
 	i.armMappedLibTimer(42, 42)
 	i.mappedLibTimers.wg.Wait()
 
-	if got := calls.Load(); got != 1 {
-		t.Errorf("pass calls = %d, want 1 (stop on first success)", got)
+	if got := calls.Load(); got != mappedLibRetryAttempts {
+		t.Errorf("pass calls = %d, want %d (continue after success)", got, mappedLibRetryAttempts)
 	}
 	// arm() on a live entry also refreshes that entry's scan target/generation
 	// as a side effect; harmless here since this call is only a read-only
 	// "is this still armed?" probe after the timer has already stopped.
 	if _, armed := i.mappedLibTimers.arm(42, 42); !armed {
-		t.Errorf("pid still armed after success; expected retired")
+		t.Errorf("pid still armed after attempt cap; expected retired")
 	}
 }
 
@@ -141,8 +140,8 @@ func TestReattachContainerArmsTimerWithExecPid(t *testing.T) {
 	}
 	i.mappedLibTimers.wg.Wait()
 
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("mappedLibPass calls = %d, want 1", got)
+	if got := calls.Load(); got != mappedLibRetryAttempts {
+		t.Fatalf("mappedLibPass calls = %d, want %d", got, mappedLibRetryAttempts)
 	}
 	if gotContainerPid != containerPid {
 		t.Errorf("mappedLibPass containerPid = %d, want %d", gotContainerPid, containerPid)
@@ -184,13 +183,17 @@ func TestMappedLibTimerDoubleArmDedup(t *testing.T) {
 
 	i.armMappedLibTimer(99, 99)
 	waitFor(t, func() bool { return calls.Load() == 1 }, "first pass to start")
-	i.armMappedLibTimer(99, 99) // must NOT arm a second goroutine
+	i.armMappedLibTimer(99, 99) // refreshes budget without a second goroutine
+	time.Sleep(20 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("concurrent pass calls = %d, want 1", got)
+	}
 
 	close(block)
 	i.mappedLibTimers.wg.Wait()
 
-	if got := calls.Load(); got != 1 {
-		t.Errorf("pass calls = %d, want 1 (double-arm must dedup)", got)
+	if got := calls.Load(); got != 2*mappedLibRetryAttempts {
+		t.Errorf("pass calls = %d, want %d (one refreshed attempt budget)", got, 2*mappedLibRetryAttempts)
 	}
 }
 
@@ -855,10 +858,8 @@ func TestFanOutMappedLibPassGivesEveryHandlerAnAttemptOnDeadlineOverrun(t *testi
 	}
 }
 
-// TestFanOutMappedLibPassSkipsAlreadySatisfiedHandlers confirms a handler that
-// already reports HasMappedLibForPid==true is never called and still counts
-// toward anyAttached, regardless of deadline state.
-func TestFanOutMappedLibPassSkipsAlreadySatisfiedHandlers(t *testing.T) {
+// A prior attachment is not proof that every matching library is covered.
+func TestFanOutMappedLibPassRescansAttachedHandlers(t *testing.T) {
 	satisfied := &fakeMappedLibHandler{hasMappedLib: true}
 	pending := &fakeMappedLibHandler{}
 	handlers := map[string]mappedLibHandler{"satisfied": satisfied, "pending": pending}
@@ -870,13 +871,75 @@ func TestFanOutMappedLibPassSkipsAlreadySatisfiedHandlers(t *testing.T) {
 	satisfied.mu.Lock()
 	satisfiedCalls := satisfied.calls
 	satisfied.mu.Unlock()
-	if satisfiedCalls != 0 {
-		t.Errorf("satisfied handler got %d ReattachContainerMappedLibsPid calls, want 0 (already-attached handlers must be skipped, not re-scanned)", satisfiedCalls)
+	if satisfiedCalls != 1 {
+		t.Errorf("satisfied handler got %d ReattachContainerMappedLibsPid calls, want 1 (already-attached handlers must be re-scanned)", satisfiedCalls)
 	}
 	pending.mu.Lock()
 	pendingCalls := pending.calls
 	pending.mu.Unlock()
 	if pendingCalls != 1 {
 		t.Errorf("pending handler got %d calls, want 1", pendingCalls)
+	}
+}
+
+// lateMappedLibHandler models two different mapped inodes: libA is visible
+// immediately; libB is loaded later in the same PID or a later exec PID.
+type lateMappedLibHandler struct {
+	available map[uint32][]string
+	attached  map[string]bool
+}
+
+func (f *lateMappedLibHandler) HasMappedLibForPid(uint32) bool { return len(f.attached) > 0 }
+func (f *lateMappedLibHandler) ReattachContainerMappedLibsPid(_ uint32, pid uint32, _ *regexp.Regexp) error {
+	for _, lib := range f.available[pid] {
+		f.attached[lib] = true
+	}
+	return nil
+}
+
+func TestMappedLibTimerDiscoversLaterLibraryAfterSuccess(t *testing.T) {
+	for _, laterPID := range []bool{false, true} {
+		name := "same_pid"
+		if laterPID {
+			name = "later_pid"
+		}
+		t.Run(name, func(t *testing.T) {
+			shrinkBackoff(t)
+			f := &lateMappedLibHandler{available: map[uint32][]string{200: {"libA"}}, attached: map[string]bool{}}
+			handlers := map[string]mappedLibHandler{"ssl": f}
+			first := make(chan struct{})
+			resume := make(chan struct{})
+			passes := 0
+			i := newTimerInstance(func(cp uint32, pids []uint32, p *regexp.Regexp, d time.Time) (bool, []uint32) {
+				passes++
+				attached := fanOutMappedLibPass(handlers, cp, pids, p, d, func(uint32, error) {})
+				if passes == 1 {
+					close(first)
+					<-resume
+				}
+				return attached, nil
+			})
+			i.armMappedLibTimer(100, 200)
+			<-first
+			if laterPID {
+				f.available[201] = []string{"libB"}
+				i.armMappedLibTimer(100, 201)
+			} else {
+				f.available[200] = []string{"libA", "libB"}
+			}
+			close(resume)
+			i.mappedLibTimers.wg.Wait()
+			if !f.attached["libA"] || !f.attached["libB"] {
+				t.Fatalf("attached=%v, want both libA and libB", f.attached)
+			}
+		})
+	}
+}
+
+func TestFanOutMappedLibPassScansEveryPIDAfterSuccess(t *testing.T) {
+	f := &lateMappedLibHandler{available: map[uint32][]string{200: {"libA"}, 201: {"libB"}}, attached: map[string]bool{}}
+	fanOutMappedLibPass(map[string]mappedLibHandler{"ssl": f}, 100, []uint32{200, 201}, nil, time.Now().Add(time.Hour), func(uint32, error) {})
+	if !f.attached["libA"] || !f.attached["libB"] {
+		t.Fatalf("attached=%v, want both libA and libB", f.attached)
 	}
 }
