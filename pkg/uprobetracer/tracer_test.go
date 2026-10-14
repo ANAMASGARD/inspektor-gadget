@@ -1207,7 +1207,7 @@ func TestReattachContainerPidIsExecPidWrapper(t *testing.T) {
 // the code compiles with two separate pid parameters.
 //
 // containerPid=100 and execPid=200 are deliberately different pids, and only
-// execPid's synthetic /proc entries are populated (no /proc/100 at all): if a
+// Only execPid has maps/exe; containerPid has a matching ns/mnt: if a
 // future change accidentally scanned/opened by containerPid instead of
 // execPid, readProcMntns(containerPid) would fail against the synthetic
 // HostProcFs root (no such directory), discoverAndOpenMappedLibraries would
@@ -1242,8 +1242,8 @@ func TestReattachContainerMappedLibsPidUsesExecPidForDiscovery(t *testing.T) {
 	pattern := regexp.MustCompile(`^libnetty.*\.so$`)
 
 	// Populate proc/<execPid>/{maps,ns/mnt,exe} under the synthetic root.
-	// Deliberately do NOT create anything under proc/<containerPid>, so a
-	// wrong-pid scan is detectable via these routings, not the arch-check.
+	// The container namespace must match, but only execPid has maps/exe.
+	// A wrong-pid scan remains detectable through the missing container maps.
 	execDir := filepath.Join(tmpDir, fmt.Sprint(execPid))
 	if err := os.MkdirAll(filepath.Join(execDir, "ns"), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -1257,6 +1257,14 @@ func TestReattachContainerMappedLibsPidUsesExecPidForDiscovery(t *testing.T) {
 	}
 	if err := os.Symlink(selfExe, filepath.Join(execDir, "exe")); err != nil {
 		t.Fatalf("symlinking exe: %v", err)
+	}
+
+	containerNs := filepath.Join(tmpDir, fmt.Sprint(containerPid), "ns")
+	if err := os.MkdirAll(containerNs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("mnt:[4026532999]", filepath.Join(containerNs, "mnt")); err != nil {
+		t.Fatal(err)
 	}
 
 	tr, st := newTestTracer(t)

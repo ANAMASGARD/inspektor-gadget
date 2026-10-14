@@ -261,8 +261,9 @@ type Tracer[Event any] struct {
 	// run concurrently; attachWg lets Close join the in-flight ones. It defaults to
 	// the process-wide globalAttachSem -- see maxConcurrentAttaches for why the
 	// budget cannot be per-tracer -- and SetAttachSemaphore replaces it.
-	attachSem chan struct{}
-	attachWg  sync.WaitGroup
+	attachSem               chan struct{}
+	startupMappedLibPattern *regexp.Regexp
+	attachWg                sync.WaitGroup
 	// syncAttach makes AttachContainer run the attach INLINE instead of dispatching
 	// it. Off in production; unit tests set it so create-time bookkeeping is
 	// observable synchronously.
@@ -1417,6 +1418,18 @@ func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid, execPid uin
 		return nil, nil
 	}
 
+	// A startup snapshot can outlive a child PID or its namespace membership.
+	// Pin map_files opening to the tracked container's namespace, rather than
+	// accepting a newly recycled child PID's namespace as authoritative.
+	if execPid != containerPid {
+		containerMntns, err := readProcMntns(containerPid)
+		if err != nil || containerMntns != expectedMntns {
+			t.logger.Debugf("uprobetracer: mapped-library pid %d no longer shares container %d mount namespace", execPid, containerPid)
+			return nil, nil
+		}
+		expectedMntns = containerMntns
+	}
+
 	libs, err := discoverMappedLibraries(execPid, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("discovering mapped libraries for containerPid %d execPid %d: %w", containerPid, execPid, err)
@@ -1679,18 +1692,22 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 	}
 	paths = dedupPaths(append(paths, libPaths...))
 	if len(paths) == 0 {
+		if job.settled {
+			t.attachExistingProcesses(job.pid)
+		}
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q", job.progName, job.pid, job.attachSymbol)
 		return
 	}
 	opened, _ := t.openTargets(ctx, job.pid, paths)
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed {
+		t.mu.Unlock()
 		closeOpened(opened)
 		return
 	}
 	if _, tracked := t.containerPid2Inodes[job.pid]; !tracked {
+		t.mu.Unlock()
 		closeOpened(opened)
 		return
 	}
@@ -1699,6 +1716,10 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", job.progName, job.pid, paths)
 	} else {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed)", job.progName, job.pid, paths)
+	}
+	t.mu.Unlock()
+	if job.settled {
+		t.attachExistingProcesses(job.pid)
 	}
 }
 
