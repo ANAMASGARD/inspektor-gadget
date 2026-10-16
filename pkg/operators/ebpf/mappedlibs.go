@@ -29,7 +29,6 @@ package ebpfoperator
 // per-gadget MappedLibRetryPatternVar. A nil combined matcher disables retries.
 // The context matcher does not change startup scans or other gadget instances.
 //
-// Lock discipline: the cancel-then-join on
 // Lock discipline: cancel-then-join on DetachContainer/Close MUST NOT happen
 // while holding a uprobe tracer's t.mu. The
 // timer is cancelled via a closed channel and joined via a per-timer WaitGroup,
