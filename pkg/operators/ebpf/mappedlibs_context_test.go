@@ -171,3 +171,37 @@ func TestMappedLibContextInvalidValueFailsConstruction(t *testing.T) {
 		t.Fatalf("construction accepted invalid context matcher: instance=%v, err=%v", instance, err)
 	}
 }
+
+// A compiled regexp may quote to end-of-input. Appending a grouping suffix
+// changes its parse, so valid individual regexps need not form a valid union.
+func TestMappedLibContextUncombinablePatternReturnsError(t *testing.T) {
+	SetMappedLibPattern(regexp.MustCompile(`^libnetty.*\.so$`))
+	t.Cleanup(func() { SetMappedLibPattern(nil) })
+	legacy := mappedLibPatternGlobal.Load()
+	pattern := regexp.MustCompile(`\Qlibssl.so.3`)
+	if !pattern.MatchString("libssl.so.3") {
+		t.Fatal("regression requires a valid standalone context matcher")
+	}
+	ctx := newResolverGadgetCtx(t, nil)
+	ctx.SetVar(MappedLibRetryPatternVar, pattern)
+	instance := &ebpfInstance{}
+	err := instance.configureMappedLibPatterns(ctx)
+	if err == nil || !strings.Contains(err.Error(), MappedLibRetryPatternVar) {
+		t.Fatalf("expected a contextual combination error, got %v", err)
+	}
+	if instance.mappedLibPattern != legacy || instance.startupMappedLibPattern != legacy || mappedLibPatternGlobal.Load() != legacy {
+		t.Fatal("failed combination changed legacy or startup registration")
+	}
+
+	program := []byte("combination validation precedes ELF loading")
+	desc := content.NewDescriptorFromBytes("application/octet-stream", program)
+	store := memory.New()
+	if err := store.Push(ctx.Context(), desc, bytes.NewReader(program)); err != nil {
+		t.Fatal(err)
+	}
+	op := &ebpfOperator{}
+	constructed, err := op.InstantiateImageOperator(ctx, store, desc, nil)
+	if constructed != nil || err == nil || !strings.Contains(err.Error(), MappedLibRetryPatternVar) {
+		t.Fatalf("construction accepted an invalid matcher union: instance=%v, err=%v", constructed, err)
+	}
+}

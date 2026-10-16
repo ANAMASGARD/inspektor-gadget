@@ -61,7 +61,8 @@ import (
 // *regexp.Regexp basename matcher for this gadget's bounded mapped-library
 // retries. Set it before instantiating the gadget. It is additive to the legacy
 // global matcher, but does not affect startup scans or other gadgets. A nil
-// value (including a typed nil) adds no matcher; other types are rejected.
+// value (including a typed nil) adds no matcher. Invalid types or patterns that
+// cannot be combined with the legacy matcher fail gadget construction.
 const MappedLibRetryPatternVar = "ebpf.mapped-lib-retry-pattern"
 
 func (i *ebpfInstance) configureMappedLibPatterns(gadgetCtx operators.GadgetContext) error {
@@ -84,7 +85,11 @@ func (i *ebpfInstance) configureMappedLibPatterns(gadgetCtx operators.GadgetCont
 		return nil
 	}
 	// Group each expression so its anchors and alternatives retain their scope.
-	i.mappedLibPattern = regexp.MustCompile("(?:" + legacy.String() + ")|(?:" + pattern.String() + ")")
+	combined, err := regexp.Compile("(?:" + legacy.String() + ")|(?:" + pattern.String() + ")")
+	if err != nil {
+		return fmt.Errorf("combining %s with legacy mapped-library pattern: %w", MappedLibRetryPatternVar, err)
+	}
+	i.mappedLibPattern = combined
 	return nil
 }
 
