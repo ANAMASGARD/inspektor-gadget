@@ -142,12 +142,13 @@ func (o *ebpfOperator) InstantiateImageOperator(
 		tcHandlers:     make(map[string]*tchandler.Handler),
 		uprobeTracers:  make(map[string]*uprobetracer.Tracer[api.GadgetData]),
 
-		// Read the caller-supplied map_files matcher (P2b) once at construction.
-		// nil => feature off, no retry timers armed.
-		mappedLibPattern: mappedLibPatternGlobal.Load(),
-		mappedLibTimers:  newMappedLibTimerRegistry(),
+		mappedLibTimers: newMappedLibTimerRegistry(),
 
 		paramValues: paramValues,
+	}
+
+	if err := newInstance.configureMappedLibPatterns(gadgetCtx); err != nil {
+		return nil, err
 	}
 
 	cfg, ok := gadgetCtx.GetVar("config")
@@ -193,14 +194,11 @@ type ebpfInstance struct {
 	tcHandlers     map[string]*tchandler.Handler
 	uprobeTracers  map[string]*uprobetracer.Tracer[api.GadgetData]
 
-	// mappedLibPattern is the caller-supplied (node-agent) basename matcher for
-	// the Phase-3 (P2b) map_files discovery + attach retry timer. It is read once
-	// at construction from the package-global SetMappedLibPattern. A nil pattern
-	// means the feature is OFF: NO retry timer is ever armed (zero behaviour
-	// change). mappedLibTimers is the per-pid active-timer registry (its own mutex,
-	// never reused from i.mu or a uprobe tracer's t.mu).
-	mappedLibPattern *regexp.Regexp
-	mappedLibTimers  *mappedLibTimerRegistry
+	// Mapped-library patterns are snapshotted at construction. The context's
+	// retry-only matcher must never expand the legacy startup scan.
+	startupMappedLibPattern *regexp.Regexp
+	mappedLibPattern        *regexp.Regexp
+	mappedLibTimers         *mappedLibTimerRegistry
 	// mappedLibPass is the per-attempt discovery+attach work for the retry timer.
 	// nil in production (the timer uses i.runMappedLibPass); a test seam only.
 	mappedLibPass func(containerPid uint32, execPids []uint32, pattern *regexp.Regexp, deadline time.Time) (bool, []uint32)
@@ -364,7 +362,7 @@ func (i *ebpfInstance) newUprobeTracer(gadgetCtx operators.GadgetContext) (*upro
 	if err != nil {
 		return nil, fmt.Errorf("creating uprobe tracer: %w", err)
 	}
-	uprobeTracer.SetStartupMappedLibPattern(i.mappedLibPattern)
+	uprobeTracer.SetStartupMappedLibPattern(i.startupMappedLibPattern)
 	v, ok := gadgetCtx.GetVar(uprobetracer.AttachOffsetResolverVar)
 	if !ok {
 		return uprobeTracer, nil

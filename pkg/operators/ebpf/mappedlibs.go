@@ -25,14 +25,12 @@ package ebpfoperator
 // is mapped. A one-shot reattach at the exec event therefore finds nothing — the
 // bounded retry timer is REQUIRED to catch the late mapping.
 //
-// The matcher (mappedLibPattern) is CALLER-SUPPLIED via SetMappedLibPattern (a
-// package-global setter mirroring container-hook.SetExecEventsCollection, which
-// node-agent already calls): node-agent owns the tcnative regex and enables the
-// feature. A nil pattern means the feature is OFF and NO timer is ever armed
-// (zero behaviour change).
+// The retry matcher combines the legacy package-global pattern with an optional
+// per-gadget MappedLibRetryPatternVar. A nil combined matcher disables retries.
+// The context matcher does not change startup scans or other gadget instances.
 //
-// Lock discipline (the one real footgun): the cancel-then-join on
-// DetachContainer/Close MUST NOT happen while holding a uprobe tracer's t.mu. The
+// Lock discipline: cancel-then-join on DetachContainer/Close MUST NOT happen
+// while holding a uprobe tracer's t.mu. The
 // timer is cancelled via a closed channel and joined via a per-timer WaitGroup,
 // NEVER under t.mu. The timer goroutine only acquires t.mu transiently inside
 // ReattachContainerMappedLibsPid / HasMappedLibForPid. The registry has its own
@@ -44,6 +42,7 @@ package ebpfoperator
 // snapshotPids() fully unlocks before its return value is used.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -53,8 +52,45 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
+
+// MappedLibRetryPatternVar is a GadgetContext variable containing a
+// *regexp.Regexp basename matcher for this gadget's bounded mapped-library
+// retries. Set it before instantiating the gadget. It is additive to the legacy
+// global matcher, but does not affect startup scans or other gadgets. A nil
+// value (including a typed nil) adds no matcher. Invalid types or patterns that
+// cannot be combined with the legacy matcher fail gadget construction.
+const MappedLibRetryPatternVar = "ebpf.mapped-lib-retry-pattern"
+
+func (i *ebpfInstance) configureMappedLibPatterns(gadgetCtx operators.GadgetContext) error {
+	legacy := mappedLibPatternGlobal.Load()
+	i.startupMappedLibPattern = legacy
+	i.mappedLibPattern = legacy
+	v, ok := gadgetCtx.GetVar(MappedLibRetryPatternVar)
+	if !ok || v == nil {
+		return nil
+	}
+	pattern, ok := v.(*regexp.Regexp)
+	if !ok {
+		return fmt.Errorf("invalid %s: expected *regexp.Regexp, got %T", MappedLibRetryPatternVar, v)
+	}
+	if pattern == nil {
+		return nil
+	}
+	if legacy == nil {
+		i.mappedLibPattern = pattern
+		return nil
+	}
+	// Group each expression so its anchors and alternatives retain their scope.
+	combined, err := regexp.Compile("(?:" + legacy.String() + ")|(?:" + pattern.String() + ")")
+	if err != nil {
+		return fmt.Errorf("combining %s with legacy mapped-library pattern: %w", MappedLibRetryPatternVar, err)
+	}
+	i.mappedLibPattern = combined
+	return nil
+}
 
 // Retry-window constants, derived from the Phase-0.1 droplet measurement of the
 // exec-settle -> tcnative-dlopen delay (~0.3s for eager init, seconds for
@@ -114,10 +150,10 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 // mappedLibPatternGlobal is the package-global tcnative-or-other basename
 // matcher, set by node-agent via SetMappedLibPattern/AddMappedLibPattern before
 // any gadget is instantiated — exactly as node-agent calls
-// container-hook.SetExecEventsCollection. A nil value (the default) means the
-// feature is OFF. It is read once per ebpfInstance in newInstance into
-// i.mappedLibPattern; the atomic pointer keeps the setter race-free relative to
-// instance construction.
+// container-hook.SetExecEventsCollection. A nil value (the default) adds no
+// global pattern; a gadget can still opt into retries through its context.
+// It is snapshotted once per ebpfInstance; the atomic pointer keeps the setter
+// race-free relative to instance construction.
 //
 // SEAM DECISION (flagged for architect): the plan's preferred seam was a config
 // setter propagated from localmanager/kubemanager down to ebpfInstance. That path
@@ -200,7 +236,9 @@ func AddMappedLibPattern(pattern *regexp.Regexp) {
 // call — this is the reset entry point, not an additive one (use
 // AddMappedLibPattern to register alongside existing patterns). It mirrors
 // container-hook.SetExecEventsCollection: node-agent calls it once at startup,
-// before any gadget is instantiated. Passing nil disables the feature.
+// before any gadget is instantiated. Passing nil clears global registration;
+// per-gadget MappedLibRetryPatternVar values are independent, and existing
+// instances retain their construction-time snapshots.
 //
 // Behaviorally equivalent to the pre-additive-API version for a single caller
 // (same matching outcomes) — but NOT pointer-identical: Load() after Set(p) now
