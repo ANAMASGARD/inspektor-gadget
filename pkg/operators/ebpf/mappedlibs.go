@@ -30,7 +30,8 @@ package ebpfoperator
 // The context matcher does not change startup scans or other gadget instances.
 //
 // Lock discipline: the cancel-then-join on
-// DetachContainer/Close MUST NOT happen while holding a uprobe tracer's t.mu. The
+// Lock discipline: cancel-then-join on DetachContainer/Close MUST NOT happen
+// while holding a uprobe tracer's t.mu. The
 // timer is cancelled via a closed channel and joined via a per-timer WaitGroup,
 // NEVER under t.mu. The timer goroutine only acquires t.mu transiently inside
 // ReattachContainerMappedLibsPid / HasMappedLibForPid. The registry has its own
@@ -145,10 +146,10 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 // mappedLibPatternGlobal is the package-global tcnative-or-other basename
 // matcher, set by node-agent via SetMappedLibPattern/AddMappedLibPattern before
 // any gadget is instantiated — exactly as node-agent calls
-// container-hook.SetExecEventsCollection. A nil value (the default) means the
-// feature is OFF. It is read once per ebpfInstance in newInstance into
-// i.mappedLibPattern; the atomic pointer keeps the setter race-free relative to
-// instance construction.
+// container-hook.SetExecEventsCollection. A nil value (the default) adds no
+// global pattern; a gadget can still opt into retries through its context.
+// It is snapshotted once per ebpfInstance; the atomic pointer keeps the setter
+// race-free relative to instance construction.
 //
 // SEAM DECISION (flagged for architect): the plan's preferred seam was a config
 // setter propagated from localmanager/kubemanager down to ebpfInstance. That path
@@ -231,7 +232,9 @@ func AddMappedLibPattern(pattern *regexp.Regexp) {
 // call — this is the reset entry point, not an additive one (use
 // AddMappedLibPattern to register alongside existing patterns). It mirrors
 // container-hook.SetExecEventsCollection: node-agent calls it once at startup,
-// before any gadget is instantiated. Passing nil disables the feature.
+// before any gadget is instantiated. Passing nil clears global registration;
+// per-gadget MappedLibRetryPatternVar values are independent, and existing
+// instances retain their construction-time snapshots.
 //
 // Behaviorally equivalent to the pre-additive-API version for a single caller
 // (same matching outcomes) — but NOT pointer-identical: Load() after Set(p) now
