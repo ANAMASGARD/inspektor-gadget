@@ -245,7 +245,7 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 	}
 	table, err := openTable(section)
 	if err != nil {
-		return fmt.Errorf("cannot load symbol section: %w", err)
+		return fmt.Errorf("loading symbol section: %w", err)
 	}
 	if table.size == 0 {
 		return elf.ErrNoSymbols
@@ -254,14 +254,14 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 		return fmt.Errorf("length of symbol section is not a multiple of %d", entSize)
 	}
 	if section.Link == 0 || section.Link >= uint32(len(s.f.Sections)) {
-		return fmt.Errorf("cannot load string table section: %w", errors.New("section has invalid string table link"))
+		return fmt.Errorf("loading string table section: %w", errors.New("section has invalid string table link"))
 	}
 	strtab, err := openTable(s.f.Sections[section.Link])
 	if err != nil {
-		return fmt.Errorf("cannot load string table section: %w", err)
+		return fmt.Errorf("loading string table section: %w", err)
 	}
 	if err := s.loadStrings(strtab); err != nil {
-		return fmt.Errorf("cannot load string table section: %w", err)
+		return fmt.Errorf("loading string table section: %w", err)
 	}
 
 	chunk := uint64(len(s.bufs.entries)) / entSize * entSize
@@ -270,7 +270,7 @@ func (s *symbolScanner) scan(typ elf.SectionType) error {
 		n := min(chunk, table.size-pos)
 		buf := s.bufs.entries[:n]
 		if err := table.readFull(buf, pos); err != nil {
-			return fmt.Errorf("cannot load symbol section: %w", err)
+			return fmt.Errorf("loading symbol section: %w", err)
 		}
 		pos += n
 		for ; len(buf) > 0; buf = buf[entSize:] {
@@ -347,7 +347,7 @@ func (s *symbolScanner) visit(entry []byte) error {
 		match = s.strings.has(nameOff)
 	}
 	if err != nil {
-		return fmt.Errorf("cannot load string table section: %w", err)
+		return fmt.Errorf("loading string table section: %w", err)
 	}
 	if !match {
 		return nil
