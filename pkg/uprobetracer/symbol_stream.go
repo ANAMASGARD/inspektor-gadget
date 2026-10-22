@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -64,6 +65,7 @@ const (
 
 // stringSearchChunk is the chunk size of the string-table search. It is
 // symbolChunkSize, lowered only by tests so that names straddle chunk borders.
+// Tests that change it must not run in parallel.
 var stringSearchChunk = symbolChunkSize
 
 // scanBuffers are the only per-lookup allocations that scale with anything, and
@@ -115,7 +117,7 @@ func (v tableView) readFull(p []byte, off uint64) error {
 // (offsets), or, for the empty name, answers through a sliding window.
 type stringTable struct {
 	view    tableView
-	offsets []uint64 // ascending offsets of name+NUL
+	offsets []uint32 // ascending offsets of name+NUL; st_name is 32-bit
 	window  []byte   // backing buffer, fixed size
 	start   uint64   // string-table offset of window[0]
 	filled  int      // valid bytes in window
@@ -128,8 +130,10 @@ type stringTable struct {
 // be longer than pattern.
 func (t *stringTable) find(pattern, buf []byte) error {
 	m := uint64(len(pattern))
-	for pos := uint64(0); pos < t.view.size; {
-		n := min(uint64(len(buf)), t.view.size-pos)
+	// st_name is 32-bit, so no symbol can name a string past 4 GiB.
+	size := min(t.view.size, math.MaxUint32+1)
+	for pos := uint64(0); pos < size; {
+		n := min(uint64(len(buf)), size-pos)
 		chunk := buf[:n]
 		if err := t.view.readFull(chunk, pos); err != nil {
 			return err
@@ -139,10 +143,12 @@ func (t *stringTable) find(pattern, buf []byte) error {
 			if j < 0 {
 				break
 			}
-			t.offsets = append(t.offsets, pos+uint64(i+j))
+			if at := pos + uint64(i+j); at <= math.MaxUint32 {
+				t.offsets = append(t.offsets, uint32(at))
+			}
 			i += j + len(pattern)
 		}
-		if pos+n == t.view.size {
+		if pos+n == size {
 			break
 		}
 		pos += n - (m - 1)
@@ -152,7 +158,10 @@ func (t *stringTable) find(pattern, buf []byte) error {
 
 // has reports whether the string at off is exactly the wanted name.
 func (t *stringTable) has(off uint64) bool {
-	_, found := slices.BinarySearch(t.offsets, off)
+	if off > math.MaxUint32 {
+		return false
+	}
+	_, found := slices.BinarySearch(t.offsets, uint32(off))
 	return found
 }
 

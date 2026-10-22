@@ -214,13 +214,22 @@ func TestBindOrdinarySites(t *testing.T) {
 // classes exercises table decoding without a cross compiler or host binaries.
 func symbolFixture(t testing.TB, class elf.Class, kind elf.Type, static, dynamic []elf.Symbol) *os.File {
 	t.Helper()
+	return symbolFixtureOrder(t, binary.LittleEndian, class, kind, static, dynamic)
+}
+
+func symbolFixtureOrder(t testing.TB, order binary.ByteOrder, class elf.Class, kind elf.Type, static, dynamic []elf.Symbol) *os.File {
+	t.Helper()
 	data := make([]byte, 4096)
 	put := func(offset int, value any) {
 		var out bytes.Buffer
-		require.NoError(t, binary.Write(&out, binary.LittleEndian, value))
+		require.NoError(t, binary.Write(&out, order, value))
 		copy(data[offset:], out.Bytes())
 	}
-	ident := [16]byte{0x7f, 'E', 'L', 'F', byte(class), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)}
+	encoding := elf.ELFDATA2LSB
+	if order == binary.BigEndian {
+		encoding = elf.ELFDATA2MSB
+	}
+	ident := [16]byte{0x7f, 'E', 'L', 'F', byte(class), byte(encoding), byte(elf.EV_CURRENT)}
 	const sections = 128
 	const stringsAt = 512
 	const staticAt = 1024

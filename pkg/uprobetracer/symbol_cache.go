@@ -172,8 +172,9 @@ func (c *symbolCache) resolve(file *os.File, name string) (uint64, error) {
 // parseOrdinarySymbol matches cilium/ebpf v0.22's ordinary-symbol lookup,
 // including dynamic table precedence, zero-address rejection and executable
 // segment translation. It streams the tables instead of materializing them
-// (see symbol_stream.go): memory use is bounded by a few fixed-size buffers
-// and does not depend on the binary's symbol count.
+// (see symbol_stream.go): memory use is a few fixed-size buffers plus one
+// offset per occurrence of the wanted name in the string table, and does not
+// depend on the binary's symbol count.
 func parseOrdinarySymbol(file *os.File, name string) (result symbolResult, err error) {
 	// debug/elf may panic on malformed input; cilium's SafeELFFile likewise
 	// converts such panics to errors. They must never populate the negative cache.

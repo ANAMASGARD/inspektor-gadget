@@ -284,6 +284,21 @@ func fixtureSymbols() (static, dynamic []elf.Symbol) {
 
 var fixtureNames = []string{"target", "target_longer", "targe", "arget", "get", "t", "targ", "target_", "target_longerx", "object_only", "undef", "dyn_only", "dyn_onl", "yn_only", "absent", "", "ta\x00rget"}
 
+// Big-endian tables must decode like little-endian ones; real big-endian
+// binaries are only in the optional SYMSTREAM_CORPUS.
+func TestParseOrdinarySymbolMatchesMaterializedBigEndian(t *testing.T) {
+	static, dynamic := fixtureSymbols()
+	for _, class := range []elf.Class{elf.ELFCLASS32, elf.ELFCLASS64} {
+		f := symbolFixtureOrder(t, binary.BigEndian, class, elf.ET_DYN, static, dynamic)
+		for _, name := range fixtureNames {
+			requireSameLookup(t, f, name)
+		}
+		got, err := parseOrdinarySymbol(f, "target")
+		require.NoError(t, err)
+		require.Equal(t, symbolResult{found: true, address: 0x280, size: 18}, got)
+	}
+}
+
 func readAll(t testing.TB, f *os.File) []byte {
 	t.Helper()
 	data, err := os.ReadFile(f.Name())
@@ -329,6 +344,9 @@ func forEachStringTableMode(t *testing.T, test func(t *testing.T)) {
 // on both the answer and on whether the file is rejected, whatever the search
 // chunk size.
 func TestParseOrdinarySymbolMatchesMaterializedOnMalformedFiles(t *testing.T) {
+	if !stdlibMatchesMalformedOracle {
+		t.Skip("oracle is debug/elf of the running Go; before Go 1.27 it rejects some corrupted tables")
+	}
 	forEachStringTableMode(t, checkMalformedFiles)
 }
 
@@ -584,8 +602,8 @@ func TestParseOrdinarySymbolConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// A name with a very long string must work through the windowed reader: a name
-// longer than the window is compared in several pieces.
+// A name longer than the empty-name window, and longer than a search chunk in
+// the tiny-chunk mode, must match the oracle and resolve to its own symbol.
 func TestParseOrdinarySymbolNameLongerThanWindow(t *testing.T) {
 	forEachStringTableMode(t, checkNameLongerThanWindow)
 }
