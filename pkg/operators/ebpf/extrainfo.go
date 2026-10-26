@@ -16,7 +16,6 @@ package ebpfoperator
 
 import (
 	"bytes"
-	"debug/elf"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,6 +26,7 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	graphutils "github.com/inspektor-gadget/inspektor-gadget/pkg/utils/ebpf2graph"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/safeelf"
 )
 
 type extraInfoMap struct {
@@ -42,13 +42,13 @@ type extraInfoProgram struct {
 
 type extraInfoVariable struct {
 	Name   string
-	Offset uint64
-	Size   uint64
+	Offset uint32
+	Size   uint32
 	Map    string
 }
 
 func (i *ebpfInstance) addExtraInfo(gadgetCtx operators.GadgetContext) error {
-	ef, err := elf.NewFile(bytes.NewReader(i.program))
+	ef, err := safeelf.NewFile(bytes.NewReader(i.program))
 	if err != nil {
 		return fmt.Errorf("parsing elf file: %w", err)
 	}
@@ -89,8 +89,8 @@ func (i *ebpfInstance) addExtraInfo(gadgetCtx operators.GadgetContext) error {
 	for name, v := range i.collectionSpec.Variables {
 		variables = append(variables, &extraInfoVariable{
 			Name:   name,
-			Offset: uint64(v.Offset),
-			Size:   uint64(v.Size()),
+			Offset: v.Offset,
+			Size:   v.Size(),
 			Map:    v.SectionName,
 		})
 	}
@@ -146,12 +146,12 @@ func getSourceWithRelocations(insns asm.Instructions) (relocations string) {
 	iter := insns.Iterate()
 	for iter.Next() {
 		if source := iter.Ins.Source(); source != nil {
-			relocs.WriteString(fmt.Sprintf("; %s\n", source))
+			fmt.Fprintf(&relocs, "; %s\n", source)
 		}
 		if relo := btf.CORERelocationMetadata(iter.Ins); relo != nil {
-			relocs.WriteString(fmt.Sprintf("; %v\n", relo))
+			fmt.Fprintf(&relocs, "; %v\n", relo)
 		}
-		relocs.WriteString(fmt.Sprintf("%v\n", iter.Ins))
+		fmt.Fprintf(&relocs, "%v\n", iter.Ins)
 	}
 	return relocs.String()
 }

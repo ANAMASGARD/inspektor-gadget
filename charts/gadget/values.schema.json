@@ -2,6 +2,54 @@
   "$schema": "http://json-schema.org/draft-07/schema",
   "type": "object",
   "properties": {
+    "bridges": {
+      "type": "object",
+      "description": "Telemetry bridge sidecars (e.g. gpu-ebpf-bridge) that publish external telemetry into bpffs-pinned BPF maps for consumer gadgets.",
+      "properties": {
+        "gpu": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string" },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+                "tag": { "type": "string" }
+              }
+            },
+            "pollInterval": { "type": "string" },
+            "logLevel": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+            "accessMode": { "type": "string", "enum": ["toolkit-env", "hostpath", "device-plugin"] },
+            "resources": {
+              "type": "object",
+              "properties": {
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": { "type": ["string", "integer"] }
+                },
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": { "type": ["string", "integer"] }
+                }
+              }
+            },
+            "additionalEnv": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "value": { "type": "string" },
+                  "valueFrom": { "type": "object" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "config": {
       "type": "object",
       "required": [
@@ -26,6 +74,30 @@
         },
         "experimental": {
           "type": "boolean"
+        },
+        "multiTenancy": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "scope": {
+              "type": "object",
+              "properties": {
+                "apiGroup": {
+                  "type": "string"
+                },
+                "resource": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "verb": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
         },
         "eventsBufferLength": {
           "type": ["integer", "string"]
@@ -68,6 +140,56 @@
         },
         "operator": {
           "type": "object"
+        },
+        "gadgetConfigMaps": {
+          "type": "array",
+          "description": "Gadget ConfigMaps to create. Each entry creates a ConfigMap with label type=gadget-instance.",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "imageName"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Human-readable name for the gadget instance"
+              },
+              "imageName": {
+                "type": "string",
+                "description": "OCI image name for the gadget"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tags for the gadget instance"
+              },
+              "timeout": {
+                "type": "integer",
+                "description": "Timeout in nanoseconds (0 means no timeout)"
+              },
+              "logLevel": {
+                "type": "integer",
+                "description": "Log level (0=default)"
+              },
+              "nodes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Restrict gadget to specific nodes"
+              },
+              "paramValues": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Gadget parameters as key-value pairs"
+              }
+            }
+          }
         }
       }
     },
@@ -99,6 +221,47 @@
           }
         }
       }
+    },
+    "resources": {
+      "type": "object",
+      "description": "Resource requests and limits for the gadget container.",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "integer"]
+          }
+        },
+        "requests": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "integer"]
+          }
+        }
+      }
+    },
+    "dropCapSysAdmin": {
+      "type": "boolean",
+      "description": "Drop CAP_SYS_ADMIN and use CAP_BPF and CAP_PERFMON instead. Disables fanotify-based container detection. Ignored if capabilities is set."
+    },
+    "skipDefaultTolerations": {
+      "type": "boolean",
+      "description": "Skip the default NoSchedule and NoExecute Exists tolerations."
+    },
+    "tolerations": {
+      "description": "Additional tolerations for the gadget DaemonSet. An empty object is accepted for compatibility with previous chart versions.",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        {
+          "type": "object",
+          "maxProperties": 0
+        }
+      ]
     }
   }
 }

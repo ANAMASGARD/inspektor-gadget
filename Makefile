@@ -10,9 +10,10 @@ CONTAINER_IMAGES = \
 	ig \
 	gadget-builder \
 	dnstester \
+	gpu-ebpf-bridge \
 	#
 
-GADGET_BUILDER ?= $(CONTAINER_REPO_NAMESPACE)/gadget-builder:main
+GADGET_BUILDER ?= ghcr.io/inspektor-gadget/gadget-builder@sha256:1586c58ae4731fb8fb12546c031a352db34c0ce334709b9b54e6c648edae76ad
 DNSTESTER_IMAGE ?= $(CONTAINER_REPO_NAMESPACE)/dnstester:main
 CI_KERNELS_IMAGE ?= $(CONTAINER_REPO_NAMESPACE)/ci-kernels:6.15.5-debug
 
@@ -39,7 +40,7 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
 
 # This version number must be kept in sync with CI workflow lint one.
-LINTER_IMAGE ?= golangci/golangci-lint:v2.6.0@sha256:cc8c1277eefdb5f88ba1381ee30a8bdf709e3615db9c843c9fcc04d9ac1d27a8
+LINTER_IMAGE ?= golangci/golangci-lint:v2.12.2@sha256:5cceeef04e53efe1470638d4b4b4f5ceefd574955ab3941b2d9a68a8c9ad5240
 
 PLATFORMS ?= "linux/amd64,linux/arm64"
 
@@ -249,6 +250,36 @@ cross-gadget-container:
 push-gadget-container:
 	docker push $(CONTAINER_REPO):$(IMAGE_TAG)
 
+# gpu-ebpf-bridge container image
+#
+# The bridge is a separate binary and image from the main IG one
+# (see docs/design/004-gpu-telemetry-enricher.md) because it is
+# built with -tags nvml + CGO_ENABLED=1, which the base IG image
+# deliberately avoids. Deployed opt-in via the helm chart on
+# GPU-enabled nodes only.
+GPU_EBPF_BRIDGE_REPO ?= $(CONTAINER_REPO_NAMESPACE)/gpu-ebpf-bridge
+
+.PHONY: gpu-ebpf-bridge-container
+gpu-ebpf-bridge-container:
+	$(BUILD_COMMAND) --load -t $(GPU_EBPF_BRIDGE_REPO):$(IMAGE_TAG) \
+		--build-arg GOPROXY=$(GOPROXY) --build-arg VERSION=$(VERSION) \
+		-f Dockerfiles/gpu-ebpf-bridge.Dockerfile .
+
+.PHONY: push-gpu-ebpf-bridge-container
+push-gpu-ebpf-bridge-container:
+	docker push $(GPU_EBPF_BRIDGE_REPO):$(IMAGE_TAG)
+
+# gpu-ebpf-bridge binary (host build, requires cgo + a native NVML
+# development environment on the build host). Useful for local
+# testing without going through a container image. For production
+# use, prefer the container target above.
+.PHONY: gpu-ebpf-bridge
+gpu-ebpf-bridge:
+	CGO_ENABLED=1 go build -tags nvml \
+		-ldflags "-X github.com/inspektor-gadget/inspektor-gadget/internal/version.version=$(VERSION)" \
+		-o gpu-ebpf-bridge \
+		./cmd/gpu-ebpf-bridge
+
 # kubectl-gadget container image
 .PHONY: kubectl-gadget-container
 kubectl-gadget-container:
@@ -387,13 +418,17 @@ install-headers:
 remove-headers:
 	rm -rf /usr/include/gadget
 
-.PHOHY: build-gadgets
+.PHONY: build-gadgets
 build-gadgets: install/ig
 	$(MAKE) -C gadgets/ build
 
-.PHOHY: push-gadgets
+.PHONY: push-gadgets
 push-gadgets: install/ig
 	$(MAKE) -C gadgets/ push
+
+.PHONY: check-gadget-docs
+check-gadget-docs:
+	./tools/check-gadget-docs.sh
 
 .PHONY: unit-test-gadgets
 unit-test-gadgets:
@@ -431,11 +466,10 @@ update-vmlinux:
 	popd && \
 	rm -rf $$TMP
 
-.PHONY:
-%-update-latest-tag:
+%-update-latest-tag: phony_explicit
 	$(CRANE) copy $(CONTAINER_REPO_NAMESPACE)/$*:$(IMAGE_TAG) $(CONTAINER_REPO_NAMESPACE)/$*:latest
 
-.PHOHY:
+.PHONY: update-latest-tag
 update-latest-tag: $(addsuffix -update-latest-tag,$(CONTAINER_IMAGES))
 	$(MAKE) -C gadgets/ update-latest-tag
 

@@ -493,10 +493,6 @@ func (o *OciHandlerInstance) init(gadgetCtx operators.GadgetContext) error {
 		o.imageOperatorInstances = append(o.imageOperatorInstances, opInst)
 	}
 
-	// All image operators have finished reading from the OCI store; release the
-	// oras target so the blob cache can be GC'd.
-	gadgetCtx.ReleaseOrasTarget()
-
 	if len(o.imageOperatorInstances) == 0 {
 		return nil
 	}

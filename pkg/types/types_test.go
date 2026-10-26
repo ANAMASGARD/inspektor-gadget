@@ -191,3 +191,29 @@ func TestCommonDataWithEcs(t *testing.T) {
 	assert.Equal(t, "web-task", actual.Ecs.TaskFamily)
 	assert.True(t, actual.Ecs.IsEnriched())
 }
+
+func TestValidateContainerID(t *testing.T) {
+	for _, containerID := range []string{
+		"0123456789abcdef",
+		"container-1",
+		"container_1",
+		"container.1",
+		"container+1",
+		"...",
+	} {
+		assert.NoError(t, ValidateContainerID(containerID))
+	}
+
+	for _, containerID := range []string{
+		"",
+		".",
+		"..",
+		"a\nb",
+		"../container",
+		"container/name",
+		"container name",
+		"container\x1b[31m",
+	} {
+		assert.Error(t, ValidateContainerID(containerID))
+	}
+}

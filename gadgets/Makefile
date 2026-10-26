@@ -4,21 +4,30 @@ ROOT_DIR:=$(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 
 GADGET_TAG ?= $(shell ../tools/image-tag branch)
 GADGET_REPOSITORY ?= ghcr.io/inspektor-gadget/gadget
-BUILDER_IMAGE ?= ghcr.io/inspektor-gadget/gadget-builder:main
+GADGET_ARCHIVE ?= gadgets.tar
+BUILDER_IMAGE ?= ghcr.io/inspektor-gadget/gadget-builder@sha256:1586c58ae4731fb8fb12546c031a352db34c0ce334709b9b54e6c648edae76ad
 KERNEL_REPOSITORY ?= ghcr.io/inspektor-gadget/ci-kernels
 IG ?= ig
 KUBECTL_GADGET ?= kubectl-gadget
+# gpu-ebpf-bridge binary. Currently only used by gadgets/ci/gpu.
+# The caller of test-local should either have gpu-ebpf-bridge on
+# $PATH or override this variable to point at a pre-built binary.
+GPU_EBPF_BRIDGE ?= gpu-ebpf-bridge
 IG_RUNTIME ?= docker
 IG_FLAGS ?=
+# Number of times to retry pushing/signing a gadget after a failure.
+# Defaults to 0 (a single attempt) so interactive users are not slowed
+# down; CI sets this to work around flaky ghcr.io 500s on concurrent
+# manifest PUTs.
+GADGET_PUSH_RETRIES ?= 0
 IG_DEBUG_LOGS ?= true
 COSIGN ?= cosign
-# Force using legacy .sig format.
-# TODO Switch to bundle format.
-COSIGN_FLAGS ?= --new-bundle-format=false --use-signing-config=false
+COSIGN_FLAGS ?=
 CRANE ?= crane
 VIMTO ?= vimto
 VIMTO_VM_MEMORY ?= 4096M
 DOCKER ?= docker
+SUDO ?= sudo -E
 
 UNIT_TEST_DIR = test/unit
 INTEGRATION_TEST_DIR = test/integration
@@ -35,6 +44,7 @@ GADGETS ?= \
 	fsnotify \
 	profile_blockio \
 	profile_cpu \
+	profile_cuda \
 	profile_qdisc_latency \
 	profile_tcprtt \
 	tcpdump \
@@ -43,11 +53,13 @@ GADGETS ?= \
 	trace_dns \
 	trace_exec \
 	trace_fsslower \
+	trace_link \
 	trace_lsm \
 	traceloop \
 	trace_malloc \
 	trace_mount \
 	trace_oomkill \
+	trace_init_module \
 	trace_open \
 	trace_signal \
 	trace_sni \
@@ -56,6 +68,7 @@ GADGETS ?= \
 	trace_tcpdrop \
 	trace_tcpretrans \
 	top_blockio \
+	top_cpu_throttle \
 	top_file \
 	top_process \
 	top_tcp \
@@ -67,7 +80,15 @@ GADGETS ?= \
 	ci/sched_cls_drop \
 	ci/image_inspect \
 	ci/container_filtering \
+	ci/stacks \
+	ci/uprobe \
+	ci/gpu \
+	ci/test_iter_map_elem \
 	snapshot_file \
+	top_cuda_memory \
+	gpu_top \
+	gpu_top_per_pid \
+	trace_gpu_starvation \
 	#
 
 DATE=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -75,8 +96,25 @@ DATE=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GADGETS_README = $(filter-out ci/%, $(addsuffix /README.mdx, $(GADGETS)))
 GADGETS_README_DEV = $(filter-out ci/%, $(addsuffix /dev.md, $(GADGETS)))
 
+.PHONY: list-gadgets
+list-gadgets:
+	@printf '%s\n' $(GADGETS)
+
+.PHONY: export
+export:
+	@test -n "$(strip $(GADGETS))" || { echo "No gadget images to export" >&2; exit 1; }
+	$(SUDO) $(IG) image export \
+		$(foreach gadget,$(GADGETS),"$(GADGET_REPOSITORY)/$(gadget):$(GADGET_TAG)") \
+		"$(GADGET_ARCHIVE)"
+
 .PHONY: all
 all: build
+
+# make does not allow implicit rules (with '%') to be phony so let's use
+# the 'phony_explicit' dependency to make implicit rules inherit the phony
+# attribute
+.PHONY: phony_explicit
+phony_explicit:
 
 .PHONY: build
 build: $(GADGETS)
@@ -92,7 +130,7 @@ pull-builder-image:
 .PHONY: $(GADGETS)
 $(GADGETS): pull-builder-image
 	@echo "Building $@"
-	@sudo -E \
+	@$(SUDO) \
 		IG_SOURCE_PATH=$(realpath $(ROOT_DIR)/..) \
 		$(IG) image build \
 		--builder-image $(BUILDER_IMAGE) \
@@ -100,6 +138,27 @@ $(GADGETS): pull-builder-image
 		--builder-image-pull=never \
 		$$GADGET_BUILD_PARAMS \
 		$@
+
+# Gadget sources embedded in the documentation (e.g. the hello-world guide).
+# They are built to verify they compile, but never pushed.
+DOCS_GADGETS = \
+	../docs/gadget-devel/_hello-world-gadget/basic \
+	../docs/gadget-devel/_hello-world-gadget/final \
+	#
+
+.PHONY: $(DOCS_GADGETS)
+$(DOCS_GADGETS): pull-builder-image
+	@echo "Building $@"
+	@$(SUDO) \
+		IG_SOURCE_PATH=$(realpath $(ROOT_DIR)/..) \
+		$(IG) image build \
+		--builder-image $(BUILDER_IMAGE) \
+		-t hello-world-docs-$(notdir $@):latest \
+		--builder-image-pull=never \
+		$@
+
+.PHONY: validate-docs-gadgets
+validate-docs-gadgets: $(DOCS_GADGETS)
 
 .PHONY: $(GADGETS_README)
 $(GADGETS_README):
@@ -134,56 +193,76 @@ $(GADGETS_README_DEV):
 	sudo ig image inspect $(@:/dev.md=):$(GADGET_TAG) -o custom --extra-info=ebpf.sequence $$GADGET_README_DEV_PARAMS >> "$@"
 	echo -e "\`\`\`" >> "$@"
 
-%-push: %-build
+%-push: %-build phony_explicit
 	@echo "Pushing $*"
-	@sudo -E $(IG) image push $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
+	@$(SUDO) $(IG) image push $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
 
-.PHONY:
+.PHONY: push
 push: $(addsuffix -push,$(GADGETS))
 
-%-push-existing: %
+%-push-existing: % phony_explicit
 	@echo "Pushing existing $*"
-	@sudo -E $(IG) image push $(GADGET_REPOSITORY)/$*:$(GADGET_TAG) $(IG_FLAGS)
+	@n=0; \
+	until $(SUDO) $(IG) image push $(GADGET_REPOSITORY)/$*:$(GADGET_TAG) $(IG_FLAGS); do \
+		if [ $$n -ge $(GADGET_PUSH_RETRIES) ]; then \
+			echo "Push of $* failed after $$n retries"; \
+			exit 1; \
+		fi; \
+		n=$$((n+1)); \
+		echo "Push of $* failed, retry $$n/$(GADGET_PUSH_RETRIES) in $$((n*5))s..."; \
+		sleep $$((n*5)); \
+	done
 
-.PHONY:
+.PHONY: push-existing
 push-existing: $(addsuffix -push-existing,$(GADGETS))
 
-%-sign: %-push
+%-sign: %-push phony_explicit
 	@echo "Signing $*"
-	digest=$$(sudo -E $(IG) image inspect $(GADGET_REPOSITORY)/$*:$(GADGET_TAG) -o json | jq -r .Digest) ; \
+	digest=$$($(SUDO) $(IG) image inspect $(GADGET_REPOSITORY)/$*:$(GADGET_TAG) -o json | jq -r .Digest) ; \
 	$(COSIGN) sign $(COSIGN_FLAGS) --key env://COSIGN_PRIVATE_KEY --yes --recursive $(GADGET_REPOSITORY)/$*@$$digest
 
+.PHONY: sign
 sign: $(addsuffix -sign,$(GADGETS))
 
-%-sign-existing:
+%-sign-existing: phony_explicit
 	@echo "Signing existing $*"
-	digest=$$(sudo -E $(IG) image list --no-trunc | grep "$* " | awk '{ print $$3 }') ; \
-	$(COSIGN) sign $(COSIGN_FLAGS) --key env://COSIGN_PRIVATE_KEY --yes --recursive $(GADGET_REPOSITORY)/$*@$$digest
+	@digest=$$($(SUDO) $(IG) image list --no-trunc | grep "$* " | awk '{ print $$3 }') ; \
+	n=0; \
+	until $(COSIGN) sign $(COSIGN_FLAGS) --key env://COSIGN_PRIVATE_KEY --yes --recursive $(GADGET_REPOSITORY)/$*@$$digest; do \
+		if [ $$n -ge $(GADGET_PUSH_RETRIES) ]; then \
+			echo "Signing of $* failed after $$n retries"; \
+			exit 1; \
+		fi; \
+		n=$$((n+1)); \
+		echo "Signing of $* failed, retry $$n/$(GADGET_PUSH_RETRIES) in $$((n*5))s..."; \
+		sleep $$((n*5)); \
+	done
 
+.PHONY: sign-existing
 sign-existing: $(addsuffix -sign-existing,$(GADGETS))
 
-%-clean:
-	sudo -E $(IG) image remove $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
+%-clean: phony_explicit
+	$(SUDO) $(IG) image remove $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
 
-.PHONY:
+.PHONY: clean
 clean: $(addsuffix -clean,$(GADGETS))
 
-.PHONY:
+.PHONY: pull
 pull:
 	GADGET_TAG=$(GADGET_TAG) \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) && \
 	for GADGET in $(GADGETS); do \
-		sudo -E $(IG) image pull $(GADGET_REPOSITORY)/$$GADGET:$(GADGET_TAG); \
+		$(SUDO) $(IG) image pull $(GADGET_REPOSITORY)/$$GADGET:$(GADGET_TAG); \
 	done
 
-.PHONY:
-%/pull:
+%/pull: phony_explicit
 	GADGET_TAG=$(GADGET_TAG) \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) \
-	sudo -E $(IG) image pull $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
+	$(SUDO) $(IG) image pull $(GADGET_REPOSITORY)/$*:$(GADGET_TAG)
 
-.PHONY:
+.PHONY: test-unit
 test-unit: build
+	# use PATH preservation to find **right** go binary inside vimto as it's run as sudo
 	IG_VERIFY_IMAGE=$(IG_VERIFY_IMAGE) \
 	IG_DEBUG_LOGS=$(IG_DEBUG_LOGS) \
 	GADGET_TAG=$(GADGET_TAG) \
@@ -191,13 +270,12 @@ test-unit: build
 	VIMTO=$(VIMTO) \
 	VIMTO_VM_MEMORY=$(VIMTO_VM_MEMORY) \
 	$(if $(KERNEL_VERSION), \
-		# use PATH preservation to find **right** go binary inside vimto as it's run as sudo \
-		sudo -E PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
+		$(SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
 		-memory $(VIMTO_VM_MEMORY) -- go test -v ./.../$(UNIT_TEST_DIR)/..., \
-		go test -v -exec 'sudo -E' ./.../$(UNIT_TEST_DIR)/...)
+		go test -v -exec '$(SUDO)' ./.../$(UNIT_TEST_DIR)/...)
 
-.PHONY:
-%/test-unit: %
+%/test-unit: % phony_explicit
+	# use PATH preservation to find **right** go binary inside vimto as it's run as sudo
 	IG_VERIFY_IMAGE=$(IG_VERIFY_IMAGE) \
 	IG_DEBUG_LOGS=$(IG_DEBUG_LOGS) \
 	GADGET_TAG=$(GADGET_TAG) \
@@ -205,42 +283,60 @@ test-unit: build
 	VIMTO=$(VIMTO) \
 	VIMTO_VM_MEMORY=$(VIMTO_VM_MEMORY) \
 	$(if $(KERNEL_VERSION), \
-		# use PATH preservation to find **right** go binary inside vimto as it's run as sudo \
-		sudo -E PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
+		$(SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
 		-memory $(VIMTO_VM_MEMORY) -- go test -v ./$*/$(UNIT_TEST_DIR)/..., \
-		go test -v -exec 'sudo -E' ./$*/$(UNIT_TEST_DIR)/...)
+		go test -v -exec '$(SUDO)' ./$*/$(UNIT_TEST_DIR)/...)
 
-.PHONY:
-%/test-integration: %
+%/test-integration: % phony_explicit
 	IG_PATH=$(IG_PATH) \
+	GPU_EBPF_BRIDGE_PATH=$(GPU_EBPF_BRIDGE_PATH) \
 	CGO_ENABLED=0 \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) \
 	GADGET_TAG=$(GADGET_TAG) \
-	IG_FLAGS=$(IG_FLAGS) \
+	IG_FLAGS="$(IG_FLAGS)" \
 	TEST_DNS_SERVER_IMAGE=$(DNSTESTER_IMAGE) \
-	go test -v -exec 'sudo -E' ./$*/$(INTEGRATION_TEST_DIR)/...
+	go test -v -exec '$(SUDO)' ./$*/$(INTEGRATION_TEST_DIR)/...
 
-.PHONY:
-test-integration: build
+# CI-only gadgets can ship a workload container image built locally from
+# ci/<gadget>/workload/Dockerfile. It is tagged ig-<gadget>:test, e.g.
+# ig-ci-uprobe:test, and is never pushed anywhere.
+CI_WORKLOAD_GADGETS := $(patsubst %/workload/Dockerfile,%,$(wildcard ci/*/workload/Dockerfile))
+
+.PHONY: $(addsuffix /workload-image,$(CI_WORKLOAD_GADGETS))
+$(addsuffix /workload-image,$(CI_WORKLOAD_GADGETS)):
+	$(eval CI_WORKLOAD_GADGET := $(patsubst %/workload-image,%,$@))
+	$(DOCKER) build \
+		-f $(CI_WORKLOAD_GADGET)/workload/Dockerfile \
+		-t ig-$(subst /,-,$(CI_WORKLOAD_GADGET)):test \
+		$(CI_WORKLOAD_GADGET)/workload
+
+define CI_WORKLOAD_INTEGRATION_PREREQUISITE
+$(1)/test-integration: $(1)/workload-image
+endef
+$(foreach gadget,$(CI_WORKLOAD_GADGETS),$(eval $(call CI_WORKLOAD_INTEGRATION_PREREQUISITE,$(gadget))))
+
+.PHONY: test-integration
+test-integration: build $(addsuffix /workload-image,$(filter $(GADGETS),$(CI_WORKLOAD_GADGETS)))
 	IG_PATH=$(IG_PATH) \
+	GPU_EBPF_BRIDGE_PATH=$(GPU_EBPF_BRIDGE_PATH) \
 	CGO_ENABLED=0 \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) \
 	GADGET_TAG=$(GADGET_TAG) \
-	IG_FLAGS=$(IG_FLAGS) \
+	IG_FLAGS="$(IG_FLAGS)" \
 	TEST_DNS_SERVER_IMAGE=$(DNSTESTER_IMAGE) \
-	go test -v -exec 'sudo -E' ./.../$(INTEGRATION_TEST_DIR)/...
+	go test -v -exec '$(SUDO)' ./.../$(INTEGRATION_TEST_DIR)/...
 
-.PHONY:
+.PHONY: test-local
 test-local: IG_PATH=$(IG)
+test-local: GPU_EBPF_BRIDGE_PATH=$(GPU_EBPF_BRIDGE)
 test-local: test-integration
 
-.PHONY:
+.PHONY: test-k8s
 test-k8s: IG_PATH=$(KUBECTL_GADGET)
 test-k8s: test-integration
 
-.PHONY:
-%-update-latest-tag:
+%-update-latest-tag: phony_explicit
 	$(CRANE) copy $(GADGET_REPOSITORY)/$*:$(GADGET_TAG) $(GADGET_REPOSITORY)/$*:latest
 
-.PHONY:
+.PHONY: update-latest-tag
 update-latest-tag: $(addsuffix -update-latest-tag,$(GADGETS))

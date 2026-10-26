@@ -114,7 +114,7 @@ func (d *debuginfodResolverInstance) newSymbolTableFromPath(path string, buildID
 	}
 	defer file.Close()
 
-	// Check if the file is empty
+	// Check if the file is empty or too large
 	if fi, err := file.Stat(); err != nil {
 		log.Warnf("Failed to stat debuginfo file %s: %v", path, err)
 		return nil, nil
@@ -122,12 +122,22 @@ func (d *debuginfodResolverInstance) newSymbolTableFromPath(path string, buildID
 		suggestedCmd := fmt.Sprintf("rm -f %s", path)
 		log.Warnf("Debuginfo %s for %s in %s is empty. Suggested remedial: %q", buildIDStr, task.Name, path, suggestedCmd)
 		return nil, nil
+	} else if fi.Size() > symbolizer.MaxExecutableSize {
+		log.Warnf("Debuginfo file %s too large (%d bytes, max %d)", path, fi.Size(), symbolizer.MaxExecutableSize)
+		return nil, nil
 	}
 
 	return symbolizer.NewSymbolTableFromFile(file)
 }
 
-func (d *debuginfodResolverInstance) Resolve(task symbolizer.Task, stackQueries []symbolizer.StackItemQuery, stackResponses []symbolizer.StackItemResponse) error {
+func (d *debuginfodResolverInstance) GetEbpfReplacements() map[string]any {
+	return nil
+}
+
+func (d *debuginfodResolverInstance) Close() {
+}
+
+func (d *debuginfodResolverInstance) Resolve(task symbolizer.Task, stackQueries []symbolizer.StackItemQuery, stackResponses []symbolizer.StackItemResponse) ([]symbolizer.StackItemResponse, error) {
 	for i, query := range stackQueries {
 		if !query.ValidBuildID {
 			continue
@@ -154,7 +164,7 @@ func (d *debuginfodResolverInstance) Resolve(task symbolizer.Task, stackQueries 
 		var err error
 		table, err = d.newSymbolTableFromPath(debuginfoPath, buildIDStr, task)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if table == nil {
 			// The debuginfo file was not available, but it is not a fatal error.
@@ -175,5 +185,5 @@ func (d *debuginfodResolverInstance) Resolve(task symbolizer.Task, stackQueries 
 		d.lockSymbolTablesFromBuildID.Unlock()
 	}
 
-	return nil
+	return nil, nil
 }

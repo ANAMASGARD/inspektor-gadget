@@ -23,7 +23,7 @@ import (
 
 var (
 	integration      = flag.Bool("integration", false, "run integration tests")
-	testBuilderImage = flag.String("builder-image", "ghcr.io/inspektor-gadget/gadget-builder:main", "gadget builder image")
+	testBuilderImage = flag.String("builder-image", "ghcr.io/inspektor-gadget/gadget-builder@sha256:1586c58ae4731fb8fb12546c031a352db34c0ce334709b9b54e6c648edae76ad", "gadget builder image")
 )
 
 func TestMain(m *testing.M) {

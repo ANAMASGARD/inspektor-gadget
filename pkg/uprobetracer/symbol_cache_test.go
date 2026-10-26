@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -208,6 +209,48 @@ func TestBindOrdinarySites(t *testing.T) {
 	links, err = tr.bindOrdinarySites(nil, []uint64{0x220}, bind)
 	require.NoError(t, err)
 	require.Len(t, links, 1)
+}
+
+// The fork's ordinary-symbol cache must not hide the upstream fallback for
+// stripped Go executables, whose function names live in .gopclntab.
+func TestBindOrdinarySitesStrippedGo(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "main.go")
+	require.NoError(t, os.WriteFile(source, []byte(`package main
+//go:noinline
+func target() { println("target") }
+func main() { target() }
+`), 0o600))
+	binary := filepath.Join(dir, "target")
+	output, err := exec.Command("go", "build", "-buildvcs=false", "-ldflags=-s -w", "-o", binary, source).CombinedOutput()
+	require.NoError(t, err, "%s", output)
+	file, err := os.Open(binary)
+	require.NoError(t, err)
+	defer file.Close()
+	_, err = ordinarySymbols.resolve(file, "main.target")
+	require.ErrorIs(t, err, link.ErrNoSymbol)
+	want, err := resolveGoSymbol(file, "main.target")
+	require.NoError(t, err)
+
+	tr := &Tracer[struct{}]{progType: ProgUprobe, attachSymbol: "main.target"}
+	bound := false
+	links, err := tr.bindOrdinarySites(file, nil, func(offset *uint64) (link.Link, error) {
+		bound = true
+		require.NotNil(t, offset)
+		require.Equal(t, want, *offset)
+		return nil, nil
+	})
+	require.NoError(t, err)
+	require.True(t, bound)
+	require.Len(t, links, 1)
+
+	// Uretprobes cannot use Go's moving goroutine stacks safely.
+	tr.progType = ProgUretprobe
+	_, err = tr.bindOrdinarySites(file, nil, func(*uint64) (link.Link, error) {
+		t.Fatal("must not attach a uretprobe using the Go fallback")
+		return nil, nil
+	})
+	require.ErrorIs(t, err, link.ErrNoSymbol)
 }
 
 // symbolFixture writes only the ELF structures needed by debug/elf. Using both

@@ -76,7 +76,7 @@ type ImageOptions struct {
 }
 
 const (
-	defaultOciStore = "/var/lib/ig/oci-store"
+	rootOciStore    = "/var/lib/ig/oci-store"
 	DefaultAuthFile = "/var/lib/ig/config.json"
 
 	PullImageAlways  = "always"
@@ -154,7 +154,13 @@ func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions)
 				return fmt.Errorf("verifying gadget signature %q: %w", image, err)
 			}
 
-			log.Warn("signature not found, will pull signing information and try verification again")
+			// The signing information is simply not in the local store yet;
+			// this is the normal path the first time an image is verified.
+			log.Debug("signature not found locally, will pull signing information and try verification again")
+
+			if imageStore.readOnly {
+				return fmt.Errorf("disabling signature pull for %q as --oci-store-user opens the user's store as read only", image)
+			}
 
 			repo, err := newRepository(imageRef, &imgOpts.AuthOptions)
 			if err != nil {
@@ -170,7 +176,9 @@ func VerifyGadgetImage(ctx context.Context, image string, imgOpts *ImageOptions)
 			// again.
 			err = puller.DefaultSignaturePuller.PullSigningInformation(ctx, repo, imageStore, desc.Digest.String())
 			if err != nil {
-				return fmt.Errorf("pulling gadget signature %q: %w", image, err)
+				log.Debugf("pulling signing information for %q: %v", image, err)
+
+				return signaturePullError(imageRef, err)
 			}
 
 			if err := imageStore.saveIndexWithLock(); err != nil {
@@ -198,7 +206,7 @@ func pullGadgetImage(ctx context.Context, image string, authOpts *AuthOptions) (
 		return nil, err
 	}
 
-	if err := ociStore.saveIndexWithLock(); err != nil {
+	if err := ociStore.saveIndexAndPruneWithLock(ctx); err != nil {
 		return nil, err
 	}
 
@@ -269,8 +277,12 @@ func pullImage(ctx context.Context, targetImage reference.Named, imageStore oras
 
 	imageDigest := desc.Digest.String()
 	if err := puller.DefaultSignaturePuller.PullSigningInformation(ctx, repo, imageStore, imageDigest); err != nil {
-		log.Warnf("error pulling signature: %v", err)
-		// it's not a requirement to have a signature for pulling the image
+		// It's not a requirement to have a signature for pulling the image, so
+		// only warn about it. Keep the warning to a single line and leave the
+		// per-puller detail to the debug log.
+		log.Debugf("pulling signing information for %q: %v", targetImage.String(), err)
+		log.Warnf("%s", signaturePullWarning(targetImage, err))
+
 		return &desc, nil
 	}
 
@@ -463,7 +475,7 @@ func ImportGadgetImages(ctx context.Context, srcFile string) ([]string, error) {
 
 	err = src.Tags(ctx, "", func(tags []string) error {
 		for _, tag := range tags {
-			_, err := oras.Copy(ctx, src, tag, ociStore, tag, oras.DefaultCopyOptions)
+			_, err := oras.ExtendedCopy(ctx, src, tag, ociStore, tag, oras.DefaultExtendedCopyOptions)
 			if err != nil {
 				return fmt.Errorf("copying to local repository: %w", err)
 			}
@@ -687,8 +699,15 @@ func deleteGadgetImage(ctx context.Context, image string) error {
 		return err
 	}
 
-	// TODO: GC() could race with other processes calling it a the same time.
-	return ociStore.GC(ctx)
+	// Reclaim the manifests and blobs the removed image was the last user
+	// of, like its per-host manifests. Store.GC() is not used for this: it
+	// computes a pruned index in memory but never writes it, so the entries
+	// it drops stay in index.json and only its blob sweep has any effect.
+	if _, err := ociStore.pruneWithLock(ctx, true); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // SplitIGDomain splits a repository name to domain and remote-name.
@@ -923,7 +942,7 @@ func EnsureImage(ctx context.Context, image string, imgOpts *ImageOptions, pullP
 			return err
 		}
 
-		return imageStore.saveIndexWithLock()
+		return imageStore.saveIndexAndPruneWithLock(ctx)
 	})
 }
 

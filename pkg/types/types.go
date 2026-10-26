@@ -16,7 +16,9 @@ package types
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -24,6 +26,26 @@ import (
 )
 
 type EventType string
+
+// ValidateContainerID rejects container IDs that are unsafe to use in logs,
+// paths, or runtime metadata. It uses the same rules as runc's validateID():
+// a non-empty string of [A-Za-z0-9_+-.] that is usable as a file name.
+func ValidateContainerID(containerID string) error {
+	if containerID == "" {
+		return errors.New("container ID is empty")
+	}
+	if strings.ContainsFunc(containerID, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') &&
+			r != '_' && r != '+' && r != '-' && r != '.'
+	}) {
+		return fmt.Errorf("container ID %q contains invalid characters", containerID)
+	}
+	// Reject IDs that cannot be used as a file name, such as "." and "..".
+	if "/"+containerID != path.Clean("/"+containerID) {
+		return fmt.Errorf("container ID %q is not usable as a file name", containerID)
+	}
+	return nil
+}
 
 var node string
 
@@ -37,6 +59,7 @@ func init() {
 	columns.MustRegisterTemplate("containerPid", "width:6,hide")
 	columns.MustRegisterTemplate("containerImageName", "width:30")
 	columns.MustRegisterTemplate("containerImageDigest", "width:30")
+	columns.MustRegisterTemplate("containerImageID", "width:30")
 	columns.MustRegisterTemplate("containerStartedAt", "width:35,hide")
 	columns.MustRegisterTemplate("comm", "maxWidth:16")
 	columns.MustRegisterTemplate("pid", "minWidth:7")
@@ -78,6 +101,7 @@ type EndpointKind string
 const (
 	EndpointKindPod     EndpointKind = "pod"
 	EndpointKindService EndpointKind = "svc"
+	EndpointKindHost    EndpointKind = "host"
 	EndpointKindRaw     EndpointKind = "raw"
 )
 
@@ -144,6 +168,9 @@ type BasicRuntimeMetadata struct {
 	// OR
 	// i.e. 6e38f40d628d, when truncated
 	ContainerImageName string `json:"containerImageName,omitempty" column:"containerImageName,hide"`
+
+	// ContainerImageID is the runtime-provided image ID (opaque to users)
+	ContainerImageID string `json:"containerImageId,omitempty" column:"containerImageID,hide"`
 
 	// ContainerImageDigest is the (repo) digest of the container image where the event comes from
 	// containerd: events from both initial and new containers are enriched
@@ -272,11 +299,16 @@ type L3Endpoint struct {
 	Addr    string `json:"addr,omitempty" column:"addr,hide,template:ipaddr"`
 	Version uint8  `json:"version,omitempty" column:"v,hide,template:ipversion"`
 
-	// Namespace, Name, Kind and PodLabels get populated by the KubeIPResolver operator
+	// Namespace, Name, Node, Kind and PodLabels get populated by the KubeIPResolver operator
 	Namespace string            `json:"namespace,omitempty" column:"ns,template:namespace,hide"`
 	Name      string            `json:"podname,omitempty" column:"name,hide"`
+	Node      string            `json:"node,omitempty" column:"node,template:node,hide"`
 	Kind      EndpointKind      `json:"kind,omitempty" column:"kind,hide"`
 	PodLabels map[string]string `json:"podlabels,omitempty" column:"podLabels,hide"`
+
+	// PodSelector contains the service's spec.selector when Kind is
+	// EndpointKindService. It holds the labels that select the backing pods
+	PodSelector map[string]string `json:"podSelector,omitempty" column:"podSelector,hide"`
 }
 
 type L4Endpoint struct {

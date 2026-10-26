@@ -20,6 +20,8 @@ import (
 	_ "net/http/pprof"
 	"os"
 
+	"golang.org/x/sys/unix"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -39,11 +41,14 @@ import (
 
 	// Another blank import for the used operator
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/btfgen"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/cgroup"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/env"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/filter"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/formatters"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/localmanager"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/logs"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/otel-profiles"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/process"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/socketenricher"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/sort"
@@ -53,6 +58,7 @@ import (
 
 	// Symbolizers (all)
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/debuginfod"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/otel"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/symtab"
 )
 
@@ -60,6 +66,10 @@ func main() {
 	if experimental.Enabled() {
 		log.Info("Experimental features enabled")
 	}
+
+	// We need this in order to read /proc/self after setting capabilities
+	// manually.
+	_ = unix.Prctl(unix.PR_SET_DUMPABLE, 1, 0, 0, 0)
 
 	rootCmd := &cobra.Command{
 		Use:   "ig",

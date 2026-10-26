@@ -20,6 +20,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 )
 
@@ -42,9 +45,13 @@ type Tracer struct {
 
 	mapType       ebpf.MapType
 	eventSize     uint32 // needed to trim trailing bytes when reading for perf event array
+	lostSampleMap *ebpf.Map
 	ringbufReader *ringbuf.Reader
 	perfReader    *perf.Reader
 	slowBuf       []byte
+	logger        logger.Logger
+	done          chan struct{}
+	closeOnce     sync.Once
 }
 
 func validateTracerMap(traceMap *ebpf.MapSpec) error {
@@ -106,6 +113,7 @@ func (i *ebpfInstance) populateTracer(t btf.Type, varName string) error {
 		mapName:    mapName,
 		structName: btfStruct.Name,
 		eventSize:  btfStruct.Size,
+		done:       make(chan struct{}),
 	}
 
 	err := i.populateStructDirect(btfStruct)
@@ -121,12 +129,68 @@ func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitG
 
 	var readCb func() (data []byte, lost uint64, err error)
 
+	cpus, err := ebpf.PossibleCPU()
+	if err != nil {
+		return fmt.Errorf("getting eBPF possibles CPUs: %w", err)
+	}
+
 	switch t.mapType {
 	case ebpf.RingBuf:
 		var rec ringbuf.Record
+		lostSamples := uint64(0)
+
+		if t.lostSampleMap != nil {
+			lostSamplesDone := make(chan struct{})
+			readLostSamples := func() {
+				defer close(lostSamplesDone)
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-t.done:
+						return
+					case <-ticker.C:
+					}
+
+					// Ring buffer does not report the number of lost samples. For this,
+					// we have a specific map, for each ring buffer, which store the
+					// number of lost samples when gadget_reserve_buf() is used.
+					// We periodically read this map to know the number of lost samples
+					// for this period. The next time the ring buffer will be read, the
+					// number of lost samples will be reported and reset until next period.
+					readValues := make([]uint64, cpus)
+					zeroValues := make([]uint64, cpus)
+					zero := uint32(0)
+
+					err := t.lostSampleMap.Lookup(&zero, readValues)
+					if err != nil {
+						t.logger.Warnf("getting lost samples: %v", err)
+
+						continue
+					}
+
+					err = t.lostSampleMap.Update(&zero, zeroValues, ebpf.UpdateExist)
+					if err != nil {
+						t.logger.Warnf("resetting lost samples: %v", err)
+
+						continue
+					}
+
+					sum := uint64(0)
+					for i := range readValues {
+						sum += readValues[i]
+					}
+					atomic.StoreUint64(&lostSamples, sum)
+				}
+			}
+
+			go readLostSamples()
+			defer func() { <-lostSamplesDone }()
+		}
+
 		readCb = func() ([]byte, uint64, error) {
 			err := t.ringbufReader.ReadInto(&rec)
-			return rec.RawSample, 0, err
+			return rec.RawSample, atomic.SwapUint64(&lostSamples, 0), err
 		}
 	case ebpf.PerfEventArray:
 		var rec perf.Record
@@ -216,12 +280,17 @@ func (t *Tracer) processEvent(gadgetCtx operators.GadgetContext, fullSample []by
 }
 
 func (t *Tracer) close() {
-	if t.ringbufReader != nil {
-		t.ringbufReader.Close()
-	}
-	if t.perfReader != nil {
-		t.perfReader.Close()
-	}
+	t.closeOnce.Do(func() {
+		if t.done != nil {
+			close(t.done)
+		}
+		if t.ringbufReader != nil {
+			t.ringbufReader.Close()
+		}
+		if t.perfReader != nil {
+			t.perfReader.Close()
+		}
+	})
 }
 
 func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Tracer) error {
@@ -241,6 +310,14 @@ func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Trac
 	case ebpf.RingBuf:
 		i.logger.Debugf("creating ringbuf reader for map %q", tracer.mapName)
 		tracer.ringbufReader, err = ringbuf.NewReader(m)
+
+		lostSamplesMapName := tracer.mapName + "_lost_samples"
+		lostSamplesMap, ok := i.collection.Maps[lostSamplesMapName]
+		if !ok {
+			i.logger.Warnf("looking up lost sample map %q: not found; ring buffer lost samples will not be reported.", lostSamplesMapName)
+		}
+		tracer.lostSampleMap = lostSamplesMap
+		tracer.logger = i.logger
 	case ebpf.PerfEventArray:
 		i.logger.Debugf("creating perf reader for map %q", tracer.mapName)
 		tracer.perfReader, err = perf.NewReader(m, gadgets.PerfBufferPages*os.Getpagesize())

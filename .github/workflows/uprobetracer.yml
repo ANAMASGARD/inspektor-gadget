@@ -4,6 +4,19 @@ on:
   pull_request:
     paths:
       - 'pkg/uprobetracer/**'
+      - 'pkg/container-hook/**'
+      - 'pkg/container-collection/**'
+      - 'pkg/tracer-collection/**'
+      - 'pkg/kfilefields/**'
+      - 'pkg/datasource/**'
+      - 'pkg/operators/**'
+      - 'pkg/gadget-context/**'
+      - 'pkg/testing/gadgetrunner/**'
+      - 'pkg/utils/syscalls/**'
+      - 'cmd/common/image/**'
+      - 'Dockerfiles/gadget-builder.Dockerfile'
+      - 'gadgets/trace_exec/**'
+      - 'include/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/uprobetracer.yml'
@@ -11,6 +24,19 @@ on:
     branches: [main]
     paths:
       - 'pkg/uprobetracer/**'
+      - 'pkg/container-hook/**'
+      - 'pkg/container-collection/**'
+      - 'pkg/tracer-collection/**'
+      - 'pkg/kfilefields/**'
+      - 'pkg/datasource/**'
+      - 'pkg/operators/**'
+      - 'pkg/gadget-context/**'
+      - 'pkg/testing/gadgetrunner/**'
+      - 'pkg/utils/syscalls/**'
+      - 'cmd/common/image/**'
+      - 'Dockerfiles/gadget-builder.Dockerfile'
+      - 'gadgets/trace_exec/**'
+      - 'include/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/uprobetracer.yml'
@@ -32,22 +58,45 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            multiarch: x86_64-linux-gnu
           - arch: arm64
             runner: ubuntu-24.04-arm
+            multiarch: aarch64-linux-gnu
     runs-on: ${{ matrix.runner }}
+    env:
+      SYMSTREAM_CORPUS: /usr/lib/${{ matrix.multiarch }}/libssl.so.3
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4.2.2
       - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26.6'
       - name: Install native test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev
+          sudo apt-get install -y build-essential libssl-dev musl-tools
       - name: Unit and race tests
-        run: go test -race -count=1 -timeout=10m ./pkg/uprobetracer
+        run: |
+          go test -race -count=1 -timeout=10m \
+            ./pkg/uprobetracer ./pkg/datasource ./pkg/histogram \
+            ./pkg/container-collection ./pkg/tracer-collection ./pkg/container-hook \
+            ./pkg/kfilefields ./pkg/operators/ebpf ./pkg/utils/syscalls
       - name: Vet
-        run: go vet ./pkg/uprobetracer
+        run: go vet ./pkg/uprobetracer ./pkg/operators/ebpf ./pkg/utils/syscalls ./pkg/testing/gadgetrunner
       - name: Kernel symbol lookup and capture tests
         run: go test -exec 'sudo -n' -count=1 -v -timeout=5m ./pkg/uprobetracer -run '^(TestCachedSymbolKernelCapture|TestCachedSymbolMatchesCilium)$'
+      - name: Build the fork CLI and exec gadget
+        env:
+          BUILDER_IMAGE: ghcr.io/inspektor-gadget/gadget-builder@sha256:1586c58ae4731fb8fb12546c031a352db34c0ce334709b9b54e6c648edae76ad
+        run: |
+          CGO_ENABLED=0 go build -buildvcs=false -o "$RUNNER_TEMP/ig" ./cmd/ig
+          sudo IG_SOURCE_PATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ig" image build \
+            --builder-image "$BUILDER_IMAGE" --builder-image-pull=missing \
+            -t localhost/ig1050/trace_exec:test gadgets/trace_exec
+      - name: Native fork and exec kernel regressions
+        run: |
+          go test -buildvcs=false -exec "sudo -n env PATH=$PATH GOTOOLCHAIN=local SYMSTREAM_CORPUS=$SYMSTREAM_CORPUS GADGET_REPOSITORY=localhost/ig1050 GADGET_TAG=test IG_VERIFY_IMAGE=false" \
+            -count=1 -v -timeout=15m \
+            ./pkg/uprobetracer ./pkg/container-hook ./pkg/kfilefields \
+            ./pkg/container-collection ./pkg/tracer-collection \
+            ./gadgets/trace_exec/test/unit

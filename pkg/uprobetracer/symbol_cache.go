@@ -207,6 +207,17 @@ func parseOrdinarySymbol(file *os.File, name string) (result symbolResult, err e
 func (t *Tracer[Event]) bindOrdinarySites(file *os.File, offsets []uint64, bind func(*uint64) (link.Link, error)) ([]link.Link, error) {
 	if len(offsets) == 0 {
 		offset, err := ordinarySymbols.resolve(file, t.attachSymbol)
+		if errors.Is(err, link.ErrNoSymbol) && t.progType == ProgUprobe {
+			// Keep the bounded ordinary-symbol cache, but retain upstream's
+			// fallback for stripped Go binaries. Go uretprobes are excluded
+			// because their return handling must account for moving stacks.
+			var goErr error
+			offset, goErr = resolveGoSymbol(file, t.attachSymbol)
+			if goErr != nil {
+				return nil, fmt.Errorf("resolving symbol %q (ELF: %w; gopclntab: %w)", t.attachSymbol, err, goErr)
+			}
+			err = nil
+		}
 		if err != nil {
 			return nil, err
 		}

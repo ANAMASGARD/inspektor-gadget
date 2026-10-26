@@ -446,7 +446,7 @@ func dedupPaths(paths []string) []string {
 // AttachProg loads the ebpf program, and try attaching if there are pending containers
 func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo string, prog *ebpf.Program) error {
 	if progType != ProgUprobe && progType != ProgUretprobe && progType != ProgUSDT {
-		return fmt.Errorf("unsupported uprobe prog type: %q", progType)
+		return fmt.Errorf("unsupported uprobe prog type: %d", progType)
 	}
 
 	if prog == nil {
@@ -782,7 +782,7 @@ func (t *Tracer[Event]) bindProbe(ex *link.Executable, offset *uint64) (link.Lin
 	case ProgUretprobe:
 		return ex.Uretprobe(t.attachSymbol, t.prog, uprobeOffsetOptions(offset))
 	default:
-		return nil, fmt.Errorf("attaching to inode: unsupported prog type: %q", t.progType)
+		return nil, fmt.Errorf("attaching to inode: unsupported prog type: %d", t.progType)
 	}
 }
 

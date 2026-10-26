@@ -92,6 +92,7 @@ Available Commands:
   import      Import images from SRC_FILE
   inspect     Inspect a gadget image
   list        List gadget images on the host
+  prune       Remove unused gadget images from the local store
   pull        Pull the specified image from a remote registry
   push        Push the specified image to a remote registry
   remove      Remove local gadget image
@@ -148,6 +149,41 @@ Flags:
 ```bash
 $ sudo ig image remove gadget
 Successfully removed gadget
+```
+
+#### `prune`
+
+Remove the manifests no gadget image refers to any more, and the blobs they
+were the last users of.
+
+Pulling or building a gadget supersedes the previous version of it, and that
+version stays in the local store, so a store used over a long time accumulates
+content nothing can reach. `ig` prunes the store index after every pull and
+build, so it does not grow without bound; this command additionally reclaims
+the disk space the unreachable blobs use.
+
+Tagged images are never removed, nor are the signatures referring to them: use
+[`remove`](#remove) to delete an image.
+
+Run it while no other `ig` process is using the store. The blobs of a gadget
+another process is pulling right now may not be reachable from the store index
+yet, and pruning would delete them.
+
+```bash
+$ sudo ig image prune -h
+Remove unused gadget images from the local store
+
+Usage:
+  ig image prune [flags]
+
+Flags:
+  -h, --help   help for prune
+```
+
+```bash
+$ sudo ig image prune
+Removed 2646 unreferenced manifests and 5096 blobs
+Total reclaimed space: 341 MB
 ```
 
 #### `pull`
@@ -491,3 +527,22 @@ $ sudo ig image verify ghcr.io/inspektor-gadget/gadget/trace_exec:v0.45.0
 Verifying image: trace_exec:v0.45.0
 Image verified successfully!
 ```
+
+#### Image store location
+
+Gadget images are stored in an OCI store whose location depends on the user:
+`/var/lib/ig/oci-store` for `root`, `~/.ig/oci-store` otherwise. A gadget built
+as your user is therefore not visible to `sudo ig image list`.
+
+All `ig image` subcommands can be run without `root`. Only `ig run` needs it, to
+load eBPF programs. Use `--oci-store-user` to run a gadget from your user store:
+
+```bash
+$ ig image build -t mygadget .
+$ sudo ig run --oci-store-user mygadget
+```
+
+This flag requires `sudo` (the store is located using `SUDO_USER`) and an
+existing user store. The store is opened read-only to avoid creating `root`
+owned files in your home directory: `--pull` is forced to `never` and signatures
+cannot be downloaded, so pull the gadget as your user first.

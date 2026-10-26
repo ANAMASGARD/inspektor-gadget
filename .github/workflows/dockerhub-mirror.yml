@@ -7,7 +7,7 @@ name: Mirror Dockerhub
 env:
   REGISTRY: ghcr.io
   CONTAINER_REPO: ${{ github.repository_owner }}
-  GO_VERSION: 1.25.5
+  GO_VERSION: 1.26.6
 on:
   workflow_dispatch:
   schedule:
@@ -28,6 +28,12 @@ jobs:
             repo: docker.io/library
           - image: nginx:latest
             repo: docker.io/library
+          # Pinned to 3.13 (not the floating "3" tag): the OTel eBPF profiler
+          # only symbolizes CPython up to 3.14, so a newer default would break
+          # stack-symbolization tests. See maxVer in:
+          # https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/1de801e979a36561ea1308533388dc61d1290150/interpreter/python/python.go#L796-L797
+          - image: python:3.13-slim
+            repo: docker.io/library
           - image: registry:2
             repo: docker.io/library
           - image: network-multitool:latest
@@ -36,19 +42,21 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4.2.2
-      - uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
             registry: ${{ env.REGISTRY }}
             username: ${{ github.actor }}
             password: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup go
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
          go-version: ${{ env.GO_VERSION }}
-      - uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
       - name: Mirror
         run: |
           crane copy \
             ${{ matrix.repo }}/${{ matrix.image }} \
-            ${{ env.REGISTRY }}/${{ env.CONTAINER_REPO }}/ci/${{ matrix.image }}
+            ${REGISTRY}/${CONTAINER_REPO}/ci/${{ matrix.image }}

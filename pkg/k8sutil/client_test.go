@@ -13,6 +13,12 @@ import (
 // either the sentinel ErrNoKubeConfig or an underlying os.IsNotExist error
 // (e.g., when the kubeconfig file is absent). This helper centralizes the
 // check so tests are robust to either behavior.
+
+const (
+	kubeconfigEnv = "KUBECONFIG"
+	homeEnv       = "HOME"
+)
+
 func isNoKubeErr(err error) bool {
 	if err == nil {
 		return false
@@ -34,23 +40,23 @@ func isNoKubeErr(err error) bool {
 // the environment (KUBECONFIG unset and $HOME/.kube/config missing) the call
 // to NewKubeConfig returns an error indicating no kubeconfig was found.
 func TestNewKubeConfig_NoKubeconfig(t *testing.T) {
-	origKube := os.Getenv("KUBECONFIG")
-	origHome := os.Getenv("HOME")
+	origKube := os.Getenv(kubeconfigEnv)
+	origHome := os.Getenv(homeEnv)
 	t.Cleanup(func() {
 		if origKube == "" {
-			_ = os.Unsetenv("KUBECONFIG")
+			_ = os.Unsetenv(kubeconfigEnv)
 		} else {
-			_ = os.Setenv("KUBECONFIG", origKube)
+			_ = os.Setenv(kubeconfigEnv, origKube)
 		}
 		if origHome == "" {
-			_ = os.Unsetenv("HOME")
+			_ = os.Unsetenv(homeEnv)
 		} else {
-			_ = os.Setenv("HOME", origHome)
+			_ = os.Setenv(homeEnv, origHome)
 		}
 	})
 
 	// Ensure KUBECONFIG is not set so code tries in-cluster/home fallback.
-	_ = os.Unsetenv("KUBECONFIG")
+	_ = os.Unsetenv(kubeconfigEnv)
 
 	// Use a fresh temporary directory as HOME so that ~/.kube/config does not exist.
 	tmpHome, err := os.MkdirTemp("", "k8sutil-no-kubeconfig-")
@@ -59,7 +65,7 @@ func TestNewKubeConfig_NoKubeconfig(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(tmpHome) })
 
-	if err := os.Setenv("HOME", tmpHome); err != nil {
+	if err := os.Setenv(homeEnv, tmpHome); err != nil {
 		t.Fatalf("failed to set HOME: %v", err)
 	}
 
@@ -83,25 +89,25 @@ func TestNewKubeConfig_NoKubeconfig(t *testing.T) {
 // to a (non-existent) path NewKubeConfig uses it and returns an error that
 // indicates the file cannot be read/found.
 func TestNewKubeConfig_HonorsKubeconfigEnvVar(t *testing.T) {
-	origKube := os.Getenv("KUBECONFIG")
-	origHome := os.Getenv("HOME")
+	origKube := os.Getenv(kubeconfigEnv)
+	origHome := os.Getenv(homeEnv)
 	t.Cleanup(func() {
 		if origKube == "" {
-			_ = os.Unsetenv("KUBECONFIG")
+			_ = os.Unsetenv(kubeconfigEnv)
 		} else {
-			_ = os.Setenv("KUBECONFIG", origKube)
+			_ = os.Setenv(kubeconfigEnv, origKube)
 		}
 		if origHome == "" {
-			_ = os.Unsetenv("HOME")
+			_ = os.Unsetenv(homeEnv)
 		} else {
-			_ = os.Setenv("HOME", origHome)
+			_ = os.Setenv(homeEnv, origHome)
 		}
 	})
 
 	// Point KUBECONFIG to a definitely-nonexistent file (do not create it).
 	tmpCfg := filepath.Join(os.TempDir(), "inspektorgadget-nonexistent-kubeconfig.yaml")
-	_ = os.Unsetenv("HOME") // ensure fallback to HOME does not interfere
-	if err := os.Setenv("KUBECONFIG", tmpCfg); err != nil {
+	_ = os.Unsetenv(homeEnv) // ensure fallback to HOME does not interfere
+	if err := os.Setenv(kubeconfigEnv, tmpCfg); err != nil {
 		t.Fatalf("failed to set KUBECONFIG: %v", err)
 	}
 

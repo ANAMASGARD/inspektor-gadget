@@ -31,6 +31,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
 	// Import this early to set the environment variable before any other package is imported
@@ -49,6 +51,7 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/gadget-container/entrypoint"
 	// Blank import for some operators
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/btfgen"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/cgroup"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/env"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/filter"
@@ -57,8 +60,10 @@ import (
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubemanager"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/kubenameresolver"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/limiter"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/logs"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/otel-logs"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/otel-metrics"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/otel-profiles"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/process"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/socketenricher"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/sort"
@@ -68,6 +73,7 @@ import (
 
 	// Symbolizers (all)
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/debuginfod"
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/otel"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/symbolizer/symtab"
 
 	gadgetservice "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service"
@@ -228,11 +234,35 @@ func main() {
 		if err != nil {
 			log.Fatalf("invalid service host: %v", err)
 		}
+
+		runConfig := gadgetservice.RunConfig{
+			SocketType: socketType,
+			SocketPath: socketPath,
+		}
+		multiTenancy := config.Config.GetBool(gadgettracermanagerconfig.MultiTenancy)
+		if multiTenancy && !experimental.Enabled() {
+			log.Fatal("multi-tenancy requires experimental features to be enabled")
+		}
+		if multiTenancy {
+			log.Infof("Config: %s=%t", gadgettracermanagerconfig.MultiTenancy, true)
+			restCfg, err := rest.InClusterConfig()
+			if err != nil {
+				log.Fatalf("building in-cluster config for multi-tenancy: %v", err)
+			}
+			restCfg.UserAgent = version.UserAgent()
+			kc, err := kubernetes.NewForConfig(restCfg)
+			if err != nil {
+				log.Fatalf("building Kubernetes client for multi-tenancy: %v", err)
+			}
+			runConfig.MultiTenancy = true
+			runConfig.KubernetesClient = kc
+			runConfig.MultiTenancyScope.APIGroup = config.Config.GetString(gadgettracermanagerconfig.MultiTenancyScopeAPIGroup)
+			runConfig.MultiTenancyScope.Resource = config.Config.GetString(gadgettracermanagerconfig.MultiTenancyScopeResource)
+			runConfig.MultiTenancyScope.Verb = config.Config.GetString(gadgettracermanagerconfig.MultiTenancyScopeVerb)
+		}
+
 		go func() {
-			err := service.Run(gadgetservice.RunConfig{
-				SocketType: socketType,
-				SocketPath: socketPath,
-			})
+			err := service.Run(runConfig)
 			if err != nil {
 				log.Fatalf("starting gadget service: %v", err)
 			}

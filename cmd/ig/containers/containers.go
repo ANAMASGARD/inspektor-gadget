@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/moby/moby/pkg/stringid"
+	"github.com/moby/moby/client/pkg/stringid"
 	"github.com/spf13/cobra"
 
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
@@ -58,7 +58,9 @@ func NewListContainersCmd() *cobra.Command {
 
 			selector := containercollection.ContainerSelector{
 				Runtime: containercollection.RuntimeSelector{
-					ContainerName: commonFlags.Containername,
+					ContainerName:        commonFlags.Containername,
+					ContainerImageID:     commonFlags.ContainerImageID,
+					ContainerImageDigest: commonFlags.ContainerImageDigest,
 				},
 				K8s: containercollection.K8sSelector{
 					BasicK8sMetadata: types.BasicK8sMetadata{

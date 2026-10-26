@@ -61,7 +61,7 @@ func (o *Operator) InstanceParams() api.Params {
 	return api.Params{
 		&api.Param{
 			Key:          symbolizersParam,
-			Description:  `Symbolizers to use. Possible values are: "none", "auto", or comma-separated list among: "symtab", "debuginfod-cache", "debuginfod-cache-on-ig-server".`,
+			Description:  `Symbolizers to use. Possible values are: "none", "auto", or comma-separated list among: "symtab", "debuginfod-cache", "debuginfod-cache-on-ig-server", "otel-ebpf-profiler".`,
 			DefaultValue: "auto",
 		},
 		&api.Param{
@@ -77,6 +77,7 @@ func (o *Operator) InstantiateDataOperator(gadgetCtx operators.GadgetContext, in
 		subscriptions: make(map[datasource.DataSource][]func(ds datasource.DataSource, data datasource.Data) error),
 		symbolizerOpts: symbolizer.SymbolizerOptions{
 			DebuginfodCachePath: instanceParamValues[debuginfodCachePathParam],
+			Context:             gadgetCtx.Context(),
 		},
 	}
 
@@ -100,12 +101,16 @@ func (o *Operator) InstantiateDataOperator(gadgetCtx operators.GadgetContext, in
 				if gadgetCtx.IsRemoteCall() {
 					instance.symbolizerOpts.UseDebugInfodCache = true
 				}
+			case "otel-ebpf-profiler":
+				instance.symbolizerOpts.UseOtelEbpfProfiler = !gadgetCtx.IsClient()
 			default:
 				return nil, fmt.Errorf("invalid symbolizer: %s", s)
 			}
 		}
 	}
-	instance.symbolizerEnabled = instance.symbolizerOpts.UseSymtab || instance.symbolizerOpts.UseDebugInfodCache
+	instance.symbolizerEnabled = instance.symbolizerOpts.UseSymtab ||
+		instance.symbolizerOpts.UseDebugInfodCache ||
+		instance.symbolizerOpts.UseOtelEbpfProfiler
 
 	err := instance.init(gadgetCtx)
 	if err != nil {
@@ -151,6 +156,24 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 			if len(tgidLevel0Field) != 1 {
 				logger.Warn("no tgid (level 0) field found")
 				continue
+			}
+			otelCorrelationIDField := in.GetSubFieldsWithTag("name:otel_correlation_id")
+			// otel_correlation_id is optional: older gadgets compiled
+			// before this field was added won't have it.
+			var hasOtelCorrelationID bool
+			if len(otelCorrelationIDField) == 1 {
+				hasOtelCorrelationID = true
+			} else if o.symbolizerOpts.UseOtelEbpfProfiler {
+				logger.Debug("otel-ebpf-profiler disabled: gadget does not have otel_correlation_id field")
+			}
+			bootTimestampField := in.GetSubFieldsWithTag("name:boot_timestamp")
+			// boot_timestamp is optional: older gadgets compiled before
+			// this field was added won't have it.
+			var hasBootTimestamp bool
+			if len(bootTimestampField) == 1 {
+				hasBootTimestamp = true
+			} else if o.symbolizerOpts.UseOtelEbpfProfiler {
+				logger.Debug("otel-ebpf-profiler: gadget does not have boot_timestamp field, using fixed timeout")
 			}
 			pidLevel0Field := in.GetSubFieldsWithTag("name:pid_level0")
 			if len(pidLevel0Field) != 1 {
@@ -254,6 +277,10 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 				}
 
 				stackId, _ := stackField[0].Uint32(data)
+				var otelCorrelationID uint64
+				if hasOtelCorrelationID {
+					otelCorrelationID, _ = otelCorrelationIDField[0].Uint64(data)
+				}
 				tgidLevel0, _ := tgidLevel0Field[0].Uint32(data)
 				pidLevel0, _ := pidLevel0Field[0].Uint32(data)
 				pidnsLevel0, _ := pidnsLevel0Field[0].Uint32(data)
@@ -339,12 +366,6 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 					buildidList := strings.Split(buildIDStr, "; ")
 					alreadyKnownSymbolsStr, _ := symbolsField.String(data)
 					alreadyKnownSymbols = strings.Split(alreadyKnownSymbolsStr, "; ")
-					for i := range alreadyKnownSymbols {
-						index := strings.IndexByte(alreadyKnownSymbols[i], ']')
-						if index >= 0 {
-							alreadyKnownSymbols[i] = alreadyKnownSymbols[i][index+1:]
-						}
-					}
 
 					for i := range addressesList {
 						if addressesList[i] == "" {
@@ -357,20 +378,19 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 							alreadyKnownSymbols = append(alreadyKnownSymbols, "")
 						}
 
-						var idx int
 						var addr uint64
 						var buildidStr string
 						var buildid [20]byte
 						var validBuildID bool
 						var offset uint64
 						var ip uint64
-						_, err := fmt.Sscanf(addressesList[i], "[%d]0x%x", &idx, &addr)
+						_, err := fmt.Sscanf(addressesList[i], "0x%x", &addr)
 						if err != nil {
 							break
 						}
-						_, err = fmt.Sscanf(buildidList[i], "[%d]%s +%x", &idx, &buildidStr, &offset)
+						_, err = fmt.Sscanf(buildidList[i], "%s +%x", &buildidStr, &offset)
 						if err != nil {
-							_, _ = fmt.Sscanf(buildidList[i], "[%d]%x", &idx, &ip)
+							_, _ = fmt.Sscanf(buildidList[i], "%x", &ip)
 							// It's ok if we don't have a build ID.
 						} else {
 							validBuildID = true
@@ -397,6 +417,10 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 				}
 
 				if o.symbolizer != nil {
+					var bootTimestamp uint64
+					if hasBootTimestamp {
+						bootTimestamp, _ = bootTimestampField[0].Uint64(data)
+					}
 					task := symbolizer.Task{
 						Name:         fmt.Sprintf("%s/%s", containerName, comm),
 						Tgid:         tgidLevel0,
@@ -409,7 +433,9 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 							MtimeSec:  mtimeSec,
 							MtimeNsec: mtimeNsec,
 						},
-						BaseAddrHash: baseAddrHash,
+						BaseAddrHash:       baseAddrHash,
+						CorrelationID:      otelCorrelationID,
+						EventBootTimestamp: bootTimestamp,
 					}
 					stackQueriesResponse, err := o.symbolizer.Resolve(task, stackQueries)
 					if err != nil {
@@ -423,7 +449,10 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 						if !res.Found && i < len(alreadyKnownSymbols) {
 							s = alreadyKnownSymbols[i]
 						}
-						fmt.Fprintf(&symbolsBuilder, "[%d]%s; ", i, s)
+						if s == "" && i < len(stackQueries) {
+							s = fmt.Sprintf("0x%x", stackQueries[i].Addr)
+						}
+						fmt.Fprintf(&symbolsBuilder, "%s; ", s)
 					}
 					symbolsField.PutString(data, symbolsBuilder.String())
 				}
@@ -438,6 +467,10 @@ func (o *OperatorInstance) init(gadgetCtx operators.GadgetContext) error {
 		o.symbolizer, err = symbolizer.NewSymbolizer(o.symbolizerOpts)
 		if err != nil {
 			return err
+		}
+		repl := o.symbolizer.GetEbpfReplacements()
+		for name, r := range repl {
+			gadgetCtx.SetVar(name, r)
 		}
 	}
 

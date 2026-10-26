@@ -36,10 +36,52 @@ type NetworkEvent struct {
 	proto    string // L4Endpoint has proto as uint8, but we need a string here
 }
 
+const (
+	// HostNetworkNoteAnnotation is set on policies where a hostNetwork peer
+	// was seen but no rule could be generated for it.
+	HostNetworkNoteAnnotation = "network-policy.inspektor-gadget.io/host-network-note"
+	hostNetworkNote           = "Host-network peer(s) detected; no portable rule was generated. Add a podSelector/namespaceSelector if supported by your CNI, or use a CNI-specific host/node policy."
+)
+
+func isResidentNodePeer(e NetworkEvent) bool {
+	return e.endpoint.Kind == types.EndpointKindHost &&
+		e.K8s.Node != "" &&
+		e.endpoint.Node == e.K8s.Node
+}
+
+func filterResidentNodePeers(events []NetworkEvent) []NetworkEvent {
+	filtered := make([]NetworkEvent, 0, len(events))
+	for _, e := range events {
+		if !isResidentNodePeer(e) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+// eventsHaveHostNetworkPeer reports whether any event has a remote or
+// unidentified host endpoint.
+func eventsHaveHostNetworkPeer(events []NetworkEvent) bool {
+	for _, e := range events {
+		if e.endpoint.Kind == types.EndpointKindHost && !isResidentNodePeer(e) {
+			return true
+		}
+	}
+	return false
+}
+
 var defaultLabelsToIgnore = map[string]struct{}{
 	"controller-revision-hash": {},
 	"pod-template-generation":  {},
 	"pod-template-hash":        {},
+	// Well-known topology labels are derived from the node the pod is scheduled
+	// on, not from the workload identity. Including them in a policy selector
+	// would pin the policy to a region/zone and stop matching the pod once it is
+	// rescheduled elsewhere, so ignore them.
+	"topology.kubernetes.io/region":            {},
+	"topology.kubernetes.io/zone":              {},
+	"failure-domain.beta.kubernetes.io/region": {},
+	"failure-domain.beta.kubernetes.io/zone":   {},
 }
 
 var LabelsToIgnore = defaultLabelsToIgnore
@@ -100,8 +142,8 @@ func networkPeerKey(e NetworkEvent) (string, error) {
 	case types.EndpointKindPod:
 		ret = string(e.endpoint.Kind) + ":" + e.endpoint.Namespace + ":" + labelKeyString(e.endpoint.PodLabels)
 	case types.EndpointKindService:
-		ret = string(e.endpoint.Kind) + ":" + e.endpoint.Namespace + ":" + labelKeyString(e.endpoint.PodLabels)
-	case types.EndpointKindRaw:
+		ret = string(e.endpoint.Kind) + ":" + e.endpoint.Namespace + ":" + labelKeyString(e.endpoint.PodSelector)
+	case types.EndpointKindRaw, types.EndpointKindHost:
 		ret = string(e.endpoint.Kind) + ":" + e.endpoint.Addr
 	default:
 		return "", fmt.Errorf("unknown endpoint kind: %s", e.endpoint.Kind)
@@ -140,7 +182,7 @@ func eventToRule(e NetworkEvent) ([]networkingv1.NetworkPolicyPort, []networking
 	case types.EndpointKindService:
 		peers = []networkingv1.NetworkPolicyPeer{
 			{
-				PodSelector: &metav1.LabelSelector{MatchLabels: e.endpoint.PodLabels},
+				PodSelector: &metav1.LabelSelector{MatchLabels: e.endpoint.PodSelector},
 			},
 		}
 		if e.K8s.Namespace != e.endpoint.Namespace {
@@ -167,6 +209,10 @@ func eventToRule(e NetworkEvent) ([]networkingv1.NetworkPolicyPort, []networking
 				},
 			}
 		}
+	case types.EndpointKindHost:
+		// Peer IP is the node's IP, shared by other pods; an IPBlock rule
+		// wouldn't target it reliably, so skip the rule (see annotation).
+		peers = []networkingv1.NetworkPolicyPeer{}
 	default:
 		return nil, nil, fmt.Errorf("unknown endpoint kind: %s", e.endpoint.Kind)
 	}
@@ -236,7 +282,11 @@ func sortEgressRules(rules []networkingv1.NetworkPolicyEgressRule) ([]networking
 func handleEvents(eventsBySource map[string][]NetworkEvent) ([]networkingv1.NetworkPolicy, error) {
 	policies := make([]networkingv1.NetworkPolicy, 0, len(eventsBySource))
 
-	for _, events := range eventsBySource {
+	for _, sourceEvents := range eventsBySource {
+		events := filterResidentNodePeers(sourceEvents)
+		if len(events) == 0 {
+			continue
+		}
 		egressNetworkPeer := map[string]NetworkEvent{}
 		ingressNetworkPeer := map[string]NetworkEvent{}
 		for _, e := range events {
@@ -304,15 +354,20 @@ func handleEvents(eventsBySource map[string][]NetworkEvent) ([]networkingv1.Netw
 			return nil, fmt.Errorf("sorting egress rules: %w", err)
 		}
 		name += "-network"
+		var annotations map[string]string
+		if eventsHaveHostNetworkPeer(events) {
+			annotations = map[string]string{HostNetworkNoteAnnotation: hostNetworkNote}
+		}
 		policy := networkingv1.NetworkPolicy{
 			TypeMeta: metav1.TypeMeta{
 				APIVersion: "networking.k8s.io/v1",
 				Kind:       "NetworkPolicy",
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: events[0].K8s.Namespace,
-				Labels:    map[string]string{},
+				Name:        name,
+				Namespace:   events[0].K8s.Namespace,
+				Labels:      map[string]string{},
+				Annotations: annotations,
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{MatchLabels: labelFilter(events[0].K8s.PodLabels)},

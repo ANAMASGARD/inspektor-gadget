@@ -86,6 +86,11 @@ func parseLine(l string, idx int) (*param, error) {
 	if mp["name"] == "__syscall_nr" {
 		return nil, nil
 	}
+	// Dynamic trace storage holds captured data such as filename strings;
+	// these fields are not part of the syscall's argument list.
+	if strings.HasPrefix(mp["type"], "__data_loc ") || strings.HasPrefix(mp["type"], "__rel_loc ") {
+		return nil, nil
+	}
 
 	var cParam param
 	cParam.name = mp["name"]

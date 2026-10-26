@@ -1,0 +1,33 @@
+# Artifact Hub package metadata file
+version: 0.56.2
+name: "trace link"
+category: monitoring-logging
+displayName: "trace link"
+createdAt: "2026-10-01T13:37:41Z"
+digest: "2026-10-01T13:37:41Z"
+description: "trace hardlink and symlink creation"
+logoURL: "https://inspektor-gadget.io/media/brand-icon.svg"
+license: ""
+homeURL: "https://inspektor-gadget.io/docs/latest/gadgets/trace_link"
+containersImages:
+    - name: gadget
+      image: "ghcr.io/inspektor-gadget/gadget/trace_link:latest"
+      platforms:
+        - linux/amd64
+        - linux/arm64
+keywords:
+    - gadget
+    - tracing
+    - hardlink
+    - symlink
+    - filesystem
+links:
+    - name: source
+      url: "https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_link"
+install: |
+    # Run
+    ```bash
+    sudo ig run ghcr.io/inspektor-gadget/gadget/trace_link:latest
+    ```
+provider:
+    name: Inspektor Gadget

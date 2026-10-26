@@ -122,6 +122,32 @@ func NormalizeCommonData(e *eventtypes.CommonData) {
 		// TODO: Verify container runtime and container name
 		e.Runtime.RuntimeName = ""
 		e.Runtime.ContainerName = ""
+
+		// Managed clusters (e.g. AKS, GKE) asynchronously inject well-known
+		// topology labels onto pods. These are not set by the tests (which only
+		// expect the "run" label from BuildCommonData), so strip them to avoid
+		// flaky mismatches depending on whether the injection landed before the
+		// event was captured.
+		stripCloudInjectedPodLabels(e.K8s.PodLabels)
+	}
+}
+
+// cloudInjectedPodLabelKeys are well-known Kubernetes topology labels that
+// managed clusters inject onto pods. They are not user-defined labels set by
+// the tests, so they must be ignored when matching captured events.
+var cloudInjectedPodLabelKeys = []string{
+	"topology.kubernetes.io/region",
+	"topology.kubernetes.io/zone",
+	// Deprecated equivalents, kept for robustness against older clusters.
+	"failure-domain.beta.kubernetes.io/region",
+	"failure-domain.beta.kubernetes.io/zone",
+}
+
+// stripCloudInjectedPodLabels removes cloud-injected topology labels from the
+// given pod labels map in place.
+func stripCloudInjectedPodLabels(podLabels map[string]string) {
+	for _, key := range cloudInjectedPodLabelKeys {
+		delete(podLabels, key)
 	}
 }
 
@@ -212,7 +238,7 @@ func getPodLogs(ns string) string {
 		cmd := exec.Command("/bin/sh", "-xc", c)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			sb.WriteString(fmt.Sprintf("Error: failed to run log command: %s, %s\n", cmd.String(), err))
+			fmt.Fprintf(&sb, "Error: failed to run log command: %s, %s\n", cmd.String(), err)
 			continue
 		}
 		sb.WriteString(string(output))

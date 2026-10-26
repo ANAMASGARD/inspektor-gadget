@@ -1,0 +1,134 @@
+// Copyright 2026 The Inspektor Gadget authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package generate_networkpolicy
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+)
+
+func TestLabelFilterIgnoresNonIdentityLabels(t *testing.T) {
+	in := map[string]string{
+		"app":                           "backend",
+		"run":                           "backend",
+		"pod-template-hash":             "abc123",
+		"topology.kubernetes.io/region": "us-east1",
+		"topology.kubernetes.io/zone":   "us-east1-c",
+		"failure-domain.beta.kubernetes.io/region": "us-east1",
+		"failure-domain.beta.kubernetes.io/zone":   "us-east1-c",
+	}
+
+	// Only user-defined workload-identity labels must survive; node-derived
+	// topology labels and ephemeral controller labels must be filtered out.
+	assert.Equal(t, map[string]string{"app": "backend", "run": "backend"}, labelFilter(in))
+
+	// labelFilteredKeyList must be consistent with labelFilter.
+	assert.Equal(t, []string{"app", "run"}, labelFilteredKeyList(in))
+}
+
+func TestHandleEvents_HostNetwork_NoRuleButAnnotated(t *testing.T) {
+	events := []NetworkEvent{
+		makeEvent(true, "prod", map[string]string{"app": "backend"},
+			types.EndpointKindHost, "", nil,
+			"192.168.58.2", 6443, "TCP"),
+	}
+	eventsBySource := map[string][]NetworkEvent{
+		localPodKey(events[0]): events,
+	}
+
+	policies, err := handleEvents(eventsBySource)
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+
+	p := policies[0]
+	// An IPBlock rule can't reliably target a shared node IP, so no rule
+	// is generated for this traffic.
+	assert.Empty(t, p.Spec.Egress)
+
+	// The policy must still carry the explanatory annotation.
+	assert.Equal(t, hostNetworkNote, p.Annotations[HostNetworkNoteAnnotation])
+}
+
+func TestHandleEvents_NoAnnotationWithoutHostNetworkPeer(t *testing.T) {
+	events := []NetworkEvent{
+		makeEvent(true, "prod", map[string]string{"app": "backend"},
+			types.EndpointKindRaw, "", nil,
+			"1.2.3.4", 443, "TCP"),
+	}
+	eventsBySource := map[string][]NetworkEvent{
+		localPodKey(events[0]): events,
+	}
+
+	policies, err := handleEvents(eventsBySource)
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	assert.Empty(t, policies[0].Annotations)
+}
+
+func TestHandleEvents_ResidentNodeIgnored(t *testing.T) {
+	residentNodeEvent := makeEvent(true, "prod", map[string]string{"app": "backend"},
+		types.EndpointKindHost, "", nil,
+		"192.168.58.2", 8080, "TCP")
+	residentNodeEvent.endpoint.Node = residentNodeEvent.K8s.Node
+	rawEvent := makeEvent(true, "prod", map[string]string{"app": "backend"},
+		types.EndpointKindRaw, "", nil,
+		"1.2.3.4", 443, "TCP")
+
+	policies, err := handleEvents(map[string][]NetworkEvent{
+		localPodKey(residentNodeEvent): {residentNodeEvent, rawEvent},
+	})
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	require.Len(t, policies[0].Spec.Egress, 1)
+	assert.Equal(t, "1.2.3.4/32", policies[0].Spec.Egress[0].To[0].IPBlock.CIDR)
+	assert.Empty(t, policies[0].Annotations)
+}
+
+func TestHandleCiliumEvents_IgnoresTopologyLabels(t *testing.T) {
+	events := []NetworkEvent{
+		makeEvent(false, "prod",
+			map[string]string{
+				"app":                           "backend",
+				"topology.kubernetes.io/region": "us-east1",
+				"topology.kubernetes.io/zone":   "us-east1-c",
+			},
+			types.EndpointKindPod, "prod",
+			map[string]string{
+				"app":                           "frontend",
+				"topology.kubernetes.io/region": "us-east1",
+				"topology.kubernetes.io/zone":   "us-east1-d",
+			},
+			"", 8080, "TCP"),
+	}
+	eventsBySource := map[string][]NetworkEvent{
+		localPodKey(events[0]): events,
+	}
+
+	policies, err := handleCiliumEvents(eventsBySource)
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+
+	p := policies[0]
+	// Topology labels must not leak into the generated selectors.
+	assert.Equal(t, map[string]string{"app": "backend"}, p.Spec.EndpointSelector.MatchLabels)
+
+	require.Len(t, p.Spec.Ingress, 1)
+	require.Len(t, p.Spec.Ingress[0].FromEndpoints, 1)
+	assert.Equal(t, map[string]string{"app": "frontend"}, p.Spec.Ingress[0].FromEndpoints[0].MatchLabels)
+}

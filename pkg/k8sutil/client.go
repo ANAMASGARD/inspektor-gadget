@@ -55,6 +55,9 @@ func NewKubeConfig(kubeconfigPath, userAgentComment string) (*rest.Config, error
 			if home := homedir.HomeDir(); home != "" {
 				config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 				if err != nil {
+					if os.IsNotExist(err) {
+						return nil, fmt.Errorf("%w: %w", ErrNoKubeConfig, err)
+					}
 					return nil, err
 				}
 			}

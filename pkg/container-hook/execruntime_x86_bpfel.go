@@ -24,10 +24,31 @@ type execruntimeRecord struct {
 	_          structs.HostLayout
 	MntnsId    uint64
 	Pid        uint32
+	Euid       uint32
 	ArgsSize   uint32
 	CallerComm [16]uint8
 	Args       [5120]uint8
+	_          [4]byte
 }
+
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	execruntimeMapExecArgs          = "exec_args"
+	execruntimeMapExecEvents        = "exec_events"
+	execruntimeMapIgFaPickCtx       = "ig_fa_pick_ctx"
+	execruntimeMapIgFaRecords       = "ig_fa_records"
+	execruntimeMapTrackedMntns      = "tracked_mntns"
+	execruntimeProgIgExecveE        = "ig_execve_e"
+	execruntimeProgIgExecveX        = "ig_execve_x"
+	execruntimeProgIgFaPickE        = "ig_fa_pick_e"
+	execruntimeProgIgFaPickX        = "ig_fa_pick_x"
+	execruntimeProgIgSchedExec      = "ig_sched_exec"
+	execruntimeVarCollectExecEvents = "collect_exec_events"
+	execruntimeVarTracerGroup       = "tracer_group"
+	execruntimeVarUnusedExecEvent   = "unused_exec_event"
+)
 
 // loadExecruntime returns the embedded CollectionSpec for execruntime.
 func loadExecruntime() (*ebpf.CollectionSpec, error) {
@@ -49,7 +70,7 @@ func loadExecruntime() (*ebpf.CollectionSpec, error) {
 //	*execruntimeMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadExecruntimeObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadExecruntimeObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadExecruntime()
 	if err != nil {
 		return err

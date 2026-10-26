@@ -34,6 +34,7 @@ import (
 	gadgetmanifest "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-manifest"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
 	apihelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api-helpers"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	clioperator "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/cli"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/combiner"
@@ -77,7 +78,7 @@ nextName:
 		for _, tmpGadgetInstance := range gadgetInstances {
 			if idOrName == tmpGadgetInstance.Id {
 				instances = append(instances, tmpGadgetInstance)
-				break nextName
+				continue nextName
 			}
 			// match partial ID or full name
 			if tmpGadgetInstance.Name == idOrName || strings.HasPrefix(tmpGadgetInstance.Id, idOrName) {
@@ -164,6 +165,22 @@ func NewRunCommand(rootCmd *cobra.Command, runtime runtime.Runtime, hiddenColumn
 			return err
 		}
 
+		if !runtime.IsClient() {
+			ociStoreUser, _ := cmd.PersistentFlags().GetBool("oci-store-user")
+			if ociStoreUser && os.Geteuid() == 0 {
+				if f := cmd.Flags().Lookup("pull"); f != nil {
+					if f.Changed && f.Value.String() != oci.PullImageNever {
+						return errors.New("--oci-store-user requires --pull=never: pulling as root would create root-owned files in the user's store")
+					}
+					if err := f.Value.Set(oci.PullImageNever); err != nil {
+						return err
+					}
+					log.Warnf("--oci-store-user is set: forcing --pull=%q", oci.PullImageNever)
+				}
+			}
+			oci.SetUseUserOciStore(ociStoreUser)
+		}
+
 		// Before running the gadget, we need to get the gadget info to be able to set
 		// things (like params) up correctly
 		actualArgs := cmd.Flags().Args()
@@ -194,15 +211,18 @@ func NewRunCommand(rootCmd *cobra.Command, runtime runtime.Runtime, hiddenColumn
 			if err != nil {
 				return fmt.Errorf("getting gadget instances: %w", err)
 			}
-			if len(notfound) > 0 || len(instances) == 0 {
-				return fmt.Errorf("gadget instance not found")
-			}
 			if len(ambiguous) > 0 {
 				return fmt.Errorf("gadget instance id or name are ambiguous")
 			}
-			imageName = instances[0].Id
+			if len(notfound) > 0 || len(instances) == 0 {
+				if !api.IsValidInstanceID(imageName) {
+					return fmt.Errorf("gadget instance not found")
+				}
+			} else {
+				imageName = instances[0].Id
+			}
 
-			if len(instances[0].Nodes) > 0 {
+			if len(instances) > 0 && len(instances[0].Nodes) > 0 {
 				// GetGadgetInfo can only be run on nodes that know about a gadget instance, so we need
 				// to make sure that the given nodes are valid
 				nodes := runtimeParams.Get(grpcruntime.ParamNode).AsStringSlice()
@@ -432,6 +452,14 @@ func NewRunCommand(rootCmd *cobra.Command, runtime runtime.Runtime, hiddenColumn
 		0,
 		"Number of seconds that the gadget will run for, 0 to run indefinitely",
 	)
+
+	if !runtime.IsClient() {
+		cmd.PersistentFlags().Bool(
+			"oci-store-user",
+			false,
+			"Use user OCI store (~/.ig/oci-store) instead of system-wide store (/var/lib/ig/oci-store)",
+		)
+	}
 
 	if commandMode != CommandModeAttach {
 		AddOCIFlags(cmd, ociParams, skipParams, runtime)

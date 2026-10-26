@@ -35,6 +35,18 @@ const (
 
 	mapIterPrefix = "gadget_mapiter_"
 
+	// Prefix used by GADGET_ITER_TARGET_MAP to bind a SEC("iter/bpf_map_elem")
+	// BPF program to the map it should iterate over. Deliberately chosen so
+	// it does NOT share a prefix with iteratorsPrefix ("gadget_iter_") —
+	// the prefix-lookup walk in analyze() matches all overlapping prefixes,
+	// so a name like "gadget_iter_target_map_..." would erroneously also be
+	// consumed by populateIterators.
+	iterTargetMapPrefix = "gadget_mapelem_iter_target_"
+
+	// Prefix used by GADGET_SK_TARGET_MAP to bind an sk_skb or sk_msg program
+	// to its sockmap or sockhash.
+	skTargetMapPrefix = "gadget_sk_prog_target_"
+
 	// Prefix used to mark variables used by operators
 	varPrefix = "gadget_var_"
 

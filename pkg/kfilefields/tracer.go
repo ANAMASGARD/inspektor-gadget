@@ -133,7 +133,7 @@ func (t *Tracer) install() error {
 
 	// Create a socket pair
 	var err error
-	t.sock, err = unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	t.sock, err = unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("creating socket pair: %w", err)
 	}

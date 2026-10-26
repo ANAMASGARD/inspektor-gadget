@@ -27,6 +27,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	igjson "github.com/inspektor-gadget/inspektor-gadget/pkg/datasource/formatters/json"
@@ -43,6 +44,7 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/local"
 
 	// TODO: create a common package with all operators
+	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/cgroup"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/ebpf"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/filter"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/operators/formatters"
@@ -60,6 +62,7 @@ type GadgetRunnerOpts[T any] struct {
 	MntnsFilterMap     *ebpf.Map
 	ParamValues        api.ParamValues
 	GlobalParamsValues api.ParamValues
+	OrasReadonlyTarget oras.ReadOnlyTarget
 
 	OnGadgetRun     func(gadgetCtx operators.GadgetContext) error
 	BeforeGadgetRun func() error
@@ -67,13 +70,14 @@ type GadgetRunnerOpts[T any] struct {
 }
 
 type GadgetRunner[T any] struct {
-	image             string
-	timeout           time.Duration
-	mntnsFilterMap    *ebpf.Map
-	paramValues       api.ParamValues
-	globalParamValues api.ParamValues
-	runtimeParams     *params.Params
-	testCtx           *testing.T
+	image              string
+	timeout            time.Duration
+	mntnsFilterMap     *ebpf.Map
+	paramValues        api.ParamValues
+	globalParamValues  api.ParamValues
+	orasReadonlyTarget oras.ReadOnlyTarget
+	runtimeParams      *params.Params
+	testCtx            *testing.T
 
 	gadgetCtx     *gadgetcontext.GadgetContext
 	DataFunc      datasource.DataFunc
@@ -107,15 +111,23 @@ func NewGadgetRunner[T any](t *testing.T, opts GadgetRunnerOpts[T]) *GadgetRunne
 		}
 	}
 
+	if publicKey := os.Getenv("IG_PUBLIC_KEY"); publicKey != "" {
+		if opts.GlobalParamsValues == nil {
+			opts.GlobalParamsValues = make(api.ParamValues)
+		}
+		opts.GlobalParamsValues["operator.oci.public-keys"] = publicKey
+	}
+
 	gadgetImage := GetGadgetImageName(opts.Image)
 	return &GadgetRunner[T]{
-		image:             gadgetImage,
-		timeout:           opts.Timeout,
-		paramValues:       opts.ParamValues,
-		globalParamValues: opts.GlobalParamsValues,
-		CapturedEvents:    make([]T, 0),
-		mntnsFilterMap:    opts.MntnsFilterMap,
-		testCtx:           t,
+		image:              gadgetImage,
+		timeout:            opts.Timeout,
+		paramValues:        opts.ParamValues,
+		globalParamValues:  opts.GlobalParamsValues,
+		orasReadonlyTarget: opts.OrasReadonlyTarget,
+		CapturedEvents:     make([]T, 0),
+		mntnsFilterMap:     opts.MntnsFilterMap,
+		testCtx:            t,
 
 		onGadgetRun:     opts.OnGadgetRun,
 		beforeGadgetRun: opts.BeforeGadgetRun,
@@ -181,6 +193,9 @@ func (g *GadgetRunner[T]) RunGadget() {
 
 	gadgetContextOps := []gadgetcontext.Option{
 		gadgetcontext.WithDataOperators(g.DataOperator...),
+	}
+	if g.orasReadonlyTarget != nil {
+		gadgetContextOps = append(gadgetContextOps, gadgetcontext.WithOrasReadonlyTarget(g.orasReadonlyTarget))
 	}
 	if g.timeout != 0 {
 		gadgetContextOps = append(gadgetContextOps, gadgetcontext.WithTimeout(g.timeout))

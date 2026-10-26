@@ -150,7 +150,7 @@ $ sudo ig list-containers -o json --containername kube-proxy
 For example, with `--host`, you can get the following output:
 
 ```bash
-$ sudo ig trace exec --host
+$ sudo ig run trace_exec:latest --host
 RUNTIME.CONTAINERNAME    PID        PPID       COMM             RET ARGS
 
 # Open another terminal.
@@ -173,7 +173,7 @@ The "kubectl debug node" command is documented in
 Examples of commands:
 
 ```bash
-$ kubectl debug --profile=sysadmin node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig trace exec
+$ kubectl debug --profile=sysadmin node/minikube-docker -ti --image=ghcr.io/inspektor-gadget/ig -- ig run trace_exec:latest
 Creating debugging pod node-debugger-minikube-docker-c2wfw with container debugger on node minikube-docker.
 If you don't see a command prompt, try pressing enter.
 RUNTIME.CONTAINERNAME          PID              PPID             COMM             RET ARGS
@@ -231,7 +231,7 @@ User=root
 Restart=on-failure
 RestartSec=30
 WorkingDirectory=/usr/local/bin
-ExecStart=/usr/local/bin/ig daemon --group ig
+ExecStart=/usr/local/bin/ig daemon --tls-insecure --group ig
 
 [Install]
 WantedBy=multi-user.target
@@ -268,7 +268,7 @@ Modify the `ig.service` file to something like this:
 
 ```
 ...
-ExecStart=/usr/local/bin/ig daemon -H tcp://127.0.0.1:9999
+ExecStart=/usr/local/bin/ig daemon --tls-insecure -H tcp://127.0.0.1:9999
 ...
 ```
 
@@ -297,7 +297,7 @@ the verbose flag (-v) like so:
 
 ```ini
 ...
-ExecStart=/usr/local/bin/ig daemon -v --group ig
+ExecStart=/usr/local/bin/ig daemon --tls-insecure -v --group ig
 ...
 ```
 
@@ -367,5 +367,5 @@ Here is an example using a Kubernetes DaemonSet: [ds-ig.yaml](https://github.com
 ```bash
 $ kubectl apply -f https://raw.githubusercontent.com/inspektor-gadget/inspektor-gadget/%IG_BRANCH%/docs/examples/ds-ig.yaml
 $ kubectl exec -ti $(kubectl get pod -o name -l name=example-ig | head -1) -- sh
-/ # ig trace exec
+/ # ig run trace_exec:latest
 ```

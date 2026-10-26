@@ -85,10 +85,13 @@ Let's try to run an image-based gadget which was not signed:
 
 ```bash
 $ sudo ig run ghcr.io/inspektor-gadget/gadget/trace_open:v0.27.0
-Error: fetching gadget information: initializing and preparing operators: instantiating operator "oci": ensuring image: verifying image "ghcr.io/inspektor-gadget/gadget/trace_open:v0.27.0": getting signing information: getting signature: getting signature bytes: ghcr.io/inspektor-gadget/gadget/trace_open:sha256-0c0e2fa72ae70e65351ab7a48a1cd5a68752a94d9c36e7b51e8764a1b7be3d7a.sig: not found
+WARN[0000] no signature found for gadget ghcr.io/inspektor-gadget/gadget/trace_open:v0.27.0
+Error: fetching gadget information: initializing and preparing operators: instantiating operator "oci": verifying image: no signature found for gadget ghcr.io/inspektor-gadget/gadget/trace_open:v0.27.0
+If the gadget is not signed and you are sure you want to skip signature verification, run or deploy Inspektor Gadget with --verify-image=false
 ```
 
 As the image was not signed, no signature was found in the repository, so the execution is denied.
+Run with `-v` to see which signature formats were tried and why each one failed.
 
 You can set your own public keys with `--public-keys`:
 
@@ -122,7 +125,7 @@ This avoids them being tampered by any users.
 By default all image-based gadgets are verified using Inspektor Gadget public key:
 
 ```bash
-$ sudo ig daemon --public-keys="$(cat your-key.pub)"
+$ sudo ig daemon --tls-insecure --public-keys="$(cat your-key.pub)"
 ...
 # Switch to another terminal
 $ gadgetctl run ghcr.io/your_repo/trace_exec
@@ -137,7 +140,7 @@ You can specify several public keys, by using a comma to separate them:
 $ IP='your_ip'
 $ PORT='your_port'
 $ ADDR=tcp://$IP:$PORT
-$ sudo ig daemon --public-keys="$(cat your-key.pub),$(cat inspektor-gadget.pub)" --host=$ADDR
+$ sudo ig daemon --tls-insecure --public-keys="$(cat your-key.pub),$(cat inspektor-gadget.pub)" --host=$ADDR
 ...
 # Switch to another terminal
 $ gadgetctl run trace_open:latest
@@ -249,7 +252,7 @@ The signing information are set once when starting `ig` as a daemon.
 This avoids them being tampered by any users.
 
 ```bash
-$ sudo ig daemon --notation-certificates="$(cat your-certificate.crt)" --notation-policy-document="$(cat your-policy-document.json)"
+$ sudo ig daemon --tls-insecure --notation-certificates="$(cat your-certificate.crt)" --notation-policy-document="$(cat your-policy-document.json)"
 ...
 # Switch to another terminal
 $ gadgetctl run ghcr.io/your_repo/trace_exec
@@ -262,7 +265,7 @@ You can specify several certificates, by using a comma to separate them:
 $ IP='your_ip'
 $ PORT='your_port'
 $ ADDR=tcp://$IP:$PORT
-$ sudo ig daemon --notation-certificates="$(cat your-1st-certificate.crt),$(cat your-2nd-certificate.crt)" --notation-policy-document=$(cat your-policy-document.json) --host=$ADDR
+$ sudo ig daemon --tls-insecure --notation-certificates="$(cat your-1st-certificate.crt),$(cat your-2nd-certificate.crt)" --notation-policy-document=$(cat your-policy-document.json) --host=$ADDR
 ...
 # Switch to another terminal
 $ gadgetctl run ghcr.io/your-repo/gadget/trace_open:your_1st_tag
@@ -319,7 +322,7 @@ RUNTIME.CONTAINERNAME  PID          UID          GID          MNTNS_ID RET FL…
 
 <TabItem value="ig-daemon" label="ig daemon">
 ```bash
-$ sudo ig daemon --verify-image=false
+$ sudo ig daemon --tls-insecure --verify-image=false
 ...
 # Switch to another terminal
 $ gadgetctl run ghcr.io/your-repo/gadget/trace_open:latest

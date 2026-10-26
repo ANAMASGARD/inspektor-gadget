@@ -31,6 +31,11 @@ import (
 const (
 	name     = "GenerateNetworkPolicy"
 	Priority = 9200
+
+	ParamPolicyFormat   = "policy-format"
+	PolicyFormatK8s     = "k8s"
+	PolicyFormatCilium  = "cilium"
+	defaultPolicyFormat = PolicyFormatK8s
 )
 
 type gnpOperator struct{}
@@ -48,24 +53,36 @@ func (s *gnpOperator) GlobalParams() api.Params {
 }
 
 func (s *gnpOperator) InstanceParams() api.Params {
-	return nil
+	return api.Params{
+		{
+			Key:            ParamPolicyFormat,
+			Title:          "Policy format",
+			Description:    "Output format for the generated network policies. Possible values: \"k8s\" (networking.k8s.io/v1 NetworkPolicy) or \"cilium\" (cilium.io/v2 CiliumNetworkPolicy).",
+			DefaultValue:   defaultPolicyFormat,
+			TypeHint:       api.TypeString,
+			PossibleValues: []string{PolicyFormatK8s, PolicyFormatCilium},
+		},
+	}
 }
 
 type k8sAccesors struct {
-	k8sHostNetwork       datasource.FieldAccessor
-	k8sNamespace         datasource.FieldAccessor
-	k8sPodLabels         datasource.FieldAccessor
-	k8sPodIP             datasource.FieldAccessor
-	k8sPodName           datasource.FieldAccessor
-	k8sOwnerName         datasource.FieldAccessor
-	endpointAddr         datasource.FieldAccessor
-	endpointPort         datasource.FieldAccessor
-	endpointK8sKind      datasource.FieldAccessor
-	endpointK8sName      datasource.FieldAccessor
-	endpointK8sNamespace datasource.FieldAccessor
-	endpointK8sLabels    datasource.FieldAccessor
-	endpointProto        datasource.FieldAccessor
-	egress               datasource.FieldAccessor
+	k8sHostNetwork         datasource.FieldAccessor
+	k8sNode                datasource.FieldAccessor
+	k8sNamespace           datasource.FieldAccessor
+	k8sPodLabels           datasource.FieldAccessor
+	k8sPodIP               datasource.FieldAccessor
+	k8sPodName             datasource.FieldAccessor
+	k8sOwnerName           datasource.FieldAccessor
+	endpointAddr           datasource.FieldAccessor
+	endpointPort           datasource.FieldAccessor
+	endpointK8sKind        datasource.FieldAccessor
+	endpointK8sName        datasource.FieldAccessor
+	endpointK8sNode        datasource.FieldAccessor
+	endpointK8sNamespace   datasource.FieldAccessor
+	endpointK8sLabels      datasource.FieldAccessor
+	endpointK8sPodSelector datasource.FieldAccessor
+	endpointProto          datasource.FieldAccessor
+	egress                 datasource.FieldAccessor
 
 	adviseDS    datasource.DataSource
 	adviseField datasource.FieldAccessor
@@ -87,6 +104,10 @@ func (s *gnpOperator) getAccessors(gadgetCtx operators.GadgetContext) (map[datas
 		acc.k8sHostNetwork = ds.GetField("k8s.hostnetwork")
 		if acc.k8sHostNetwork == nil {
 			return nil, fmt.Errorf("no hostnetwork field found")
+		}
+		acc.k8sNode = ds.GetField("k8s.node")
+		if acc.k8sNode == nil {
+			return nil, fmt.Errorf("no node field found")
 		}
 		acc.k8sNamespace = ds.GetField("k8s.namespace")
 		if acc.k8sNamespace == nil {
@@ -124,6 +145,10 @@ func (s *gnpOperator) getAccessors(gadgetCtx operators.GadgetContext) (map[datas
 		if acc.endpointK8sName == nil {
 			return nil, fmt.Errorf("no endpoint.k8s.name field found")
 		}
+		acc.endpointK8sNode = ds.GetField("endpoint.k8s.node")
+		if acc.endpointK8sNode == nil {
+			return nil, fmt.Errorf("no endpoint.k8s.node field found")
+		}
 		acc.endpointK8sNamespace = ds.GetField("endpoint.k8s.namespace")
 		if acc.endpointK8sNamespace == nil {
 			return nil, fmt.Errorf("no endpoint.k8s.namespace field found")
@@ -132,6 +157,8 @@ func (s *gnpOperator) getAccessors(gadgetCtx operators.GadgetContext) (map[datas
 		if acc.endpointK8sLabels == nil {
 			return nil, fmt.Errorf("no endpoint.k8s.labels field found")
 		}
+		// podSelector is optional: it is only set for service endpoints
+		acc.endpointK8sPodSelector = ds.GetField("endpoint.k8s.podSelector")
 		acc.endpointProto = ds.GetField("endpoint.proto")
 		if acc.endpointProto == nil {
 			return nil, fmt.Errorf("no endpoint.proto field found")
@@ -176,8 +203,18 @@ func (s *gnpOperator) InstantiateDataOperator(gadgetCtx operators.GadgetContext,
 		gadgetCtx.Logger().Debug("GenerateNetworkPolicy: no datasources requiring the operator found")
 		return nil, nil
 	}
+
+	policyFormat := instanceParamValues[ParamPolicyFormat]
+	if policyFormat == "" {
+		policyFormat = defaultPolicyFormat
+	}
+	if policyFormat != PolicyFormatK8s && policyFormat != PolicyFormatCilium {
+		return nil, fmt.Errorf("invalid policy format %q: must be %q or %q", policyFormat, PolicyFormatK8s, PolicyFormatCilium)
+	}
+
 	return &gnpOperatorInstance{
-		accessors: accessors,
+		accessors:    accessors,
+		policyFormat: policyFormat,
 	}, nil
 }
 
@@ -186,7 +223,8 @@ func (s *gnpOperator) Priority() int {
 }
 
 type gnpOperatorInstance struct {
-	accessors map[datasource.DataSource]k8sAccesors
+	accessors    map[datasource.DataSource]k8sAccesors
+	policyFormat string
 }
 
 func (s *gnpOperatorInstance) Name() string {
@@ -225,6 +263,7 @@ func (s *gnpOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 				e.endpoint.Addr, _ = acc.endpointAddr.String(data)
 				e.endpoint.Port, _ = acc.endpointPort.Uint16(data)
 				e.endpoint.Name, _ = acc.endpointK8sName.String(data)
+				e.endpoint.Node, _ = acc.endpointK8sNode.String(data)
 				e.endpoint.Namespace, _ = acc.endpointK8sNamespace.String(data)
 				e.proto, _ = acc.endpointProto.String(data)
 
@@ -241,7 +280,23 @@ func (s *gnpOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 					e.endpoint.PodLabels[kv[0]] = kv[1]
 				}
 
+				// Parse the service's pod selector if available
+				if acc.endpointK8sPodSelector != nil {
+					podSelectorRaw, _ := acc.endpointK8sPodSelector.String(data)
+					if podSelectorRaw != "" {
+						e.endpoint.PodSelector = map[string]string{}
+						for _, pair := range strings.Split(podSelectorRaw, ",") {
+							kv := strings.Split(pair, "=")
+							if len(kv) != 2 {
+								continue
+							}
+							e.endpoint.PodSelector[kv[0]] = kv[1]
+						}
+					}
+				}
+
 				e.K8s.PodName, _ = acc.k8sPodName.String(data)
+				e.K8s.Node, _ = acc.k8sNode.String(data)
 				e.K8s.Owner.Name, _ = acc.k8sOwnerName.String(data)
 				e.K8s.HostNetwork = hostNetwork
 				e.K8s.Namespace, _ = acc.k8sNamespace.String(data)
@@ -251,6 +306,11 @@ func (s *gnpOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 						continue
 					}
 					e.K8s.PodLabels[kv[0]] = kv[1]
+				}
+
+				// A NetworkPolicy needs a local pod to select.
+				if e.K8s.PodName == "" {
+					continue
 				}
 
 				// Kubernetes Network Policies can't block traffic from a pod's
@@ -266,14 +326,21 @@ func (s *gnpOperatorInstance) PreStart(gadgetCtx operators.GadgetContext) error 
 			}
 
 			if len(eventsBySource) != 0 {
-				// api.Warnf("Got %d events by source", len(eventsBySource))
-				policies, err := handleEvents(eventsBySource)
-				if err != nil {
-					return fmt.Errorf("handling events: %w", err)
+				var policiesStr string
+				switch s.policyFormat {
+				case PolicyFormatCilium:
+					ciliumPolicies, err := handleCiliumEvents(eventsBySource)
+					if err != nil {
+						return fmt.Errorf("handling cilium events: %w", err)
+					}
+					policiesStr = FormatCiliumPolicies(ciliumPolicies)
+				default:
+					k8sPolicies, err := handleEvents(eventsBySource)
+					if err != nil {
+						return fmt.Errorf("handling events: %w", err)
+					}
+					policiesStr = FormatPolicies(k8sPolicies)
 				}
-				// api.Warnf("> Created %d policies", len(policies))
-				policiesStr := FormatPolicies(policies)
-				//// api.Warnf("> Policies:\n%s", policiesStr[:100])
 
 				yamlPack, err := acc.adviseDS.NewPacketSingle()
 				if err != nil {

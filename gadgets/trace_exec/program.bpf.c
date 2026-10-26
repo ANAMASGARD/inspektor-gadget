@@ -7,6 +7,7 @@
 #define GADGET_NO_BUF_RESERVE
 #include <gadget/buffer.h>
 #include <gadget/common.h>
+#include <gadget/core_fixes.bpf.h>
 #include <gadget/filter.h>
 #include <gadget/macros.h>
 #include <gadget/types.h>
@@ -41,6 +42,8 @@ struct event {
 	gadget_errno error_raw;
 	int args_count;
 	int tty;
+	unsigned int tty_major;
+	unsigned int tty_minor;
 	bool from_rootfs;
 	bool file_from_rootfs;
 	bool upper_layer;
@@ -52,6 +55,9 @@ struct event {
 	unsigned int dev_major;
 	unsigned int dev_minor;
 	unsigned long inode;
+	__u64 ctime;
+	__u64 fctime;
+	__u64 pctime;
 	char exepath[GADGET_PATH_MAX];
 	char parent_exepath[GADGET_PATH_MAX];
 	char args[FULL_MAX_ARGS_ARR];
@@ -95,19 +101,55 @@ struct {
 	__type(value, __u8);
 } security_bprm_hit_map SEC(".maps");
 
+// exec_argv stores the userspace argv pointer captured at sys_enter_execve. The
+// arguments are parsed lazily: from the new process' memory in ig_sched_exec for
+// successful execs, or from the caller's still-mapped memory in exit_execve for
+// failed ones. This avoids parsing argv on the (common) successful path, where
+// the result would be overwritten by the memory read anyway.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, pid_t);
+	__type(value, __u64);
+} exec_argv SEC(".maps");
+
 GADGET_TRACER_MAP(events, 1024 * 256);
 
 GADGET_TRACER(exec, events, event);
 
-static __always_inline int enter_execve(const char *pathname, const char **args)
+// read_tty fills in the controlling terminal of the task, if any.
+//
+// tty->index alone does not identify a terminal: it is only the index of the
+// terminal within its own driver, so /dev/pts/0 and /dev/tty0 both have index
+// 0, which is also the value reported for a task without a controlling
+// terminal. The device number is what identifies the terminal unambiguously, so
+// report it as well and leave it at 0:0 when there is no controlling terminal.
+//
+// The device number is computed the same way as the kernel's tty_devnum():
+// MKDEV(tty->driver->major, tty->driver->minor_start) + tty->index
+static __always_inline void read_tty(struct event *event,
+				     struct task_struct *task)
+{
+	struct tty_struct *tty = BPF_CORE_READ(task, signal, tty);
+	if (!tty)
+		return;
+
+	struct tty_driver *driver = BPF_CORE_READ(tty, driver);
+	if (!driver)
+		return;
+
+	event->tty = BPF_CORE_READ(tty, index);
+	event->tty_major = BPF_CORE_READ(driver, major);
+	event->tty_minor = BPF_CORE_READ(driver, minor_start) + event->tty;
+}
+
+static __always_inline int enter_execve(const char **args)
 {
 	u64 id;
 	pid_t pid;
 	struct event *event;
 	struct task_struct *task;
-	unsigned int ret;
-	const char *argp;
-	int i;
+	u64 argv = (u64)args;
 
 	if (gadget_should_discard_data_current())
 		return 0;
@@ -134,10 +176,7 @@ static __always_inline int enter_execve(const char *pathname, const char **args)
 	if (bpf_core_field_exists(task->sessionid))
 		event->sessionid = BPF_CORE_READ(task, sessionid);
 
-	event->args_count = 0;
-	event->args_size = 0;
-
-	event->tty = BPF_CORE_READ(task, signal, tty, index);
+	read_tty(event, task);
 
 	if (paths) {
 		struct fs_struct *fs = BPF_CORE_READ(task, fs);
@@ -145,57 +184,26 @@ static __always_inline int enter_execve(const char *pathname, const char **args)
 		bpf_probe_read_kernel_str(event->cwd, sizeof(event->cwd), cwd);
 	}
 
-	ret = bpf_probe_read_user_str(event->args, ARGSIZE, pathname);
-	if (ret <= ARGSIZE) {
-		event->args_size += ret;
-	} else {
-		/* write an empty string */
-		event->args[0] = '\0';
-		event->args_size++;
-	}
+	// Save the argv pointer; the arguments are parsed later (see
+	// read_committed_args for successful execs and read_args_from_user for
+	// failed ones).
+	bpf_map_update_elem(&exec_argv, &pid, &argv, BPF_ANY);
 
-	event->args_count++;
-#pragma unroll
-	for (i = 1; i < TOTAL_MAX_ARGS; i++) {
-		bpf_probe_read_user(&argp, sizeof(argp), &args[i]);
-		if (!argp)
-			return 0;
-
-		if (event->args_size > LAST_ARG)
-			return 0;
-
-		ret = bpf_probe_read_user_str(&event->args[event->args_size],
-					      ARGSIZE, argp);
-		if (ret > ARGSIZE)
-			return 0;
-
-		event->args_count++;
-		event->args_size += ret;
-	}
-	/* try to read one more argument to check if there is one */
-	bpf_probe_read_user(&argp, sizeof(argp), &args[TOTAL_MAX_ARGS]);
-	if (!argp)
-		return 0;
-
-	/* pointer to max_args+1 isn't null, assume we have more arguments */
-	event->args_count++;
 	return 0;
 }
 
 SEC("tracepoint/syscalls/sys_enter_execve")
 int ig_execve_e(struct syscall_trace_enter *ctx)
 {
-	const char *pathname = (const char *)ctx->args[0];
 	const char **args = (const char **)(ctx->args[1]);
-	return enter_execve(pathname, args);
+	return enter_execve(args);
 }
 
 SEC("tracepoint/syscalls/sys_enter_execveat")
 int ig_execveat_e(struct syscall_trace_enter *ctx)
 {
-	const char *pathname = (const char *)ctx->args[1];
 	const char **args = (const char **)(ctx->args[2]);
-	return enter_execve(pathname, args);
+	return enter_execve(args);
 }
 
 static __always_inline bool __is_from_rootfs(struct task_struct *task,
@@ -240,6 +248,33 @@ static __always_inline bool has_upper_layer(struct inode *inode)
 	return upperdentry != NULL;
 }
 
+// read_committed_args re-reads the process arguments from the new process's
+// address space (mm->arg_start .. mm->arg_end)
+static __always_inline void read_committed_args(struct event *event,
+						struct task_struct *task)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	if (!mm)
+		return;
+
+	unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
+	unsigned long arg_end = BPF_CORE_READ(mm, arg_end);
+	if (arg_end <= arg_start)
+		return;
+
+	u64 args_size = arg_end - arg_start;
+	if (args_size > sizeof(event->args))
+		args_size = sizeof(event->args);
+
+	if (bpf_probe_read_user(event->args, args_size,
+				(const void *)arg_start) == 0) {
+		event->args_size = args_size;
+		// args_count only needs to be at least the number of arguments; the
+		// byte count is a cheap, safe upper bound (each argument is >= 1 byte).
+		event->args_count = args_size;
+	}
+}
+
 // tracepoint/sched/sched_process_exec is called after a successful execve
 SEC("tracepoint/sched/sched_process_exec")
 int ig_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -254,12 +289,16 @@ int ig_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
 		return 0;
 
 	struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
-	if (inode)
+	if (inode) {
 		event->upper_layer = has_upper_layer(inode);
+		event->ctime = gadget_get_ctime_nanosec_from_inode(inode);
+	}
 
 	struct inode *pinode = BPF_CORE_READ(parent, mm, exe_file, f_inode);
-	if (pinode)
+	if (pinode) {
 		event->pupper_layer = has_upper_layer(pinode);
+		event->pctime = gadget_get_ctime_nanosec_from_inode(pinode);
+	}
 
 	struct file *exe_file = BPF_CORE_READ(task, mm, exe_file);
 
@@ -267,6 +306,9 @@ int ig_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 	gadget_process_populate(&event->proc);
 	event->error_raw = 0;
+
+	// Re-read the arguments from the new process's memory
+	read_committed_args(event, task);
 
 	if (paths) {
 		char *exepath = get_path_str(&exe_file->f_path);
@@ -287,14 +329,70 @@ int ig_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 	bpf_map_delete_elem(&execs, &pre_sched_pid);
 	bpf_map_delete_elem(&security_bprm_hit_map, &pre_sched_pid);
+	bpf_map_delete_elem(&exec_argv, &pre_sched_pid);
 
 	return 0;
+}
+
+// read_args_from_user parses the argument vector at argv (a userspace pointer
+// captured at sys_enter_execve) into event->args. It is used for failed execs,
+// whose arguments never made it into a new process' memory. The caller's address
+// space is still intact at sys_exit_execve (a failing execve returns before the
+// point of no return), so the userspace argv is readable there.
+static __always_inline void read_args_from_user(struct event *event, u64 argv)
+{
+	const char **args = (const char **)argv;
+	const char *argp;
+	unsigned int ret;
+	int i;
+
+	event->args_count = 0;
+	event->args_size = 0;
+
+	/* args[0] is argv[0] (the command name) */
+	argp = NULL;
+	bpf_probe_read_user(&argp, sizeof(argp), &args[0]);
+	ret = bpf_probe_read_user_str(event->args, ARGSIZE, argp);
+	if (ret <= ARGSIZE) {
+		event->args_size += ret;
+	} else {
+		/* write an empty string */
+		event->args[0] = '\0';
+		event->args_size++;
+	}
+
+	event->args_count++;
+#pragma unroll
+	for (i = 1; i < TOTAL_MAX_ARGS; i++) {
+		bpf_probe_read_user(&argp, sizeof(argp), &args[i]);
+		if (!argp)
+			return;
+
+		if (event->args_size > LAST_ARG)
+			return;
+
+		ret = bpf_probe_read_user_str(&event->args[event->args_size],
+					      ARGSIZE, argp);
+		if (ret > ARGSIZE)
+			return;
+
+		event->args_count++;
+		event->args_size += ret;
+	}
+	/* try to read one more argument to check if there is one */
+	bpf_probe_read_user(&argp, sizeof(argp), &args[TOTAL_MAX_ARGS]);
+	if (!argp)
+		return;
+
+	/* pointer to max_args+1 isn't null, assume we have more arguments */
+	event->args_count++;
 }
 
 static __always_inline int exit_execve(void *ctx, int retval)
 {
 	u32 pid = (u32)bpf_get_current_pid_tgid();
 	struct event *event;
+	u64 *argv;
 
 	// If the execve was successful, sched/sched_process_exec handled the event
 	// already and deleted the entry. So if we find the entry, it means the
@@ -305,6 +403,13 @@ static __always_inline int exit_execve(void *ctx, int retval)
 
 	if (ignore_failed)
 		goto cleanup;
+
+	// The execve failed, so its arguments never made it into a new process'
+	// memory. Read them from the caller's still-mapped memory using the argv
+	// pointer captured at sys_enter_execve.
+	argv = bpf_map_lookup_elem(&exec_argv, &pid);
+	if (argv)
+		read_args_from_user(event, *argv);
 
 	gadget_process_populate(&event->proc);
 	event->error_raw = -retval;
@@ -324,6 +429,7 @@ static __always_inline int exit_execve(void *ctx, int retval)
 cleanup:
 	bpf_map_delete_elem(&execs, &pid);
 	bpf_map_delete_elem(&security_bprm_hit_map, &pid);
+	bpf_map_delete_elem(&exec_argv, &pid);
 	return 0;
 }
 
@@ -371,8 +477,10 @@ int BPF_KPROBE(security_bprm_check, struct linux_binprm *bprm)
 	event->file_from_rootfs = is_from_rootfs(s_file);
 
 	struct inode *inode = BPF_CORE_READ(s_file, f_inode);
-	if (inode)
+	if (inode) {
 		event->fupper_layer = has_upper_layer(inode);
+		event->fctime = gadget_get_ctime_nanosec_from_inode(inode);
+	}
 
 	if (paths) {
 		f_path = BPF_CORE_READ(bprm, file, f_path);

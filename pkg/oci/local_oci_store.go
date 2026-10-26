@@ -16,8 +16,10 @@ package oci
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -30,26 +32,96 @@ import (
 type localOciStore struct {
 	*oci.Store
 
+	storePath  string
 	indexPath  string
 	oldIndex   *ocispec.Index
 	indexFlock *flock.Flock
+	readOnly   bool
+}
+
+const userOciStoreSubDir = ".ig/oci-store"
+
+var useUserOciStore bool
+
+func SetUseUserOciStore(v bool) {
+	useUserOciStore = v
+}
+
+func getOciStorePath() (string, error) {
+	username := ""
+	if os.Geteuid() == 0 {
+		if useUserOciStore {
+			// Running as root through sudo, with --oci-store-user.
+			username = os.Getenv("SUDO_USER")
+			if username == "" {
+				return "", errors.New("--oci-store-user requires being run with sudo, not as root directly")
+			}
+		} else {
+			// Running as root, without --oci-store-user
+			return rootOciStore, nil
+		}
+	} else {
+		// Running as normal user.
+		u, err := user.Current()
+		if err != nil {
+			return "", fmt.Errorf("getting current user: %w", err)
+		}
+		username = u.Username
+	}
+
+	return getUserOciStorePath(username)
+}
+
+func getUserOciStorePath(username string) (string, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return "", fmt.Errorf("finding user %q: %w", username, err)
+	}
+
+	return filepath.Join(u.HomeDir, userOciStoreSubDir), nil
 }
 
 // newLocalOciStore returns a localOciStore that is safe when executed
 // concurrently, even from different processes.
 func newLocalOciStore() (*localOciStore, error) {
-	if err := os.MkdirAll(filepath.Dir(defaultOciStore), 0o700); err != nil {
-		return nil, err
+	ociStorePath, err := getOciStorePath()
+	if err != nil {
+		return nil, fmt.Errorf("getting OCI store path: %w", err)
 	}
 
-	indexPath := path.Join(defaultOciStore, "index.json")
-	indexLock := flock.New(path.Join(defaultOciStore, "index.json.lock"))
+	return newLocalOciStoreAt(ociStorePath)
+}
+
+// newLocalOciStoreAt opens the store at the given path.
+func newLocalOciStoreAt(ociStorePath string) (*localOciStore, error) {
+	// When running as root with --oci-store-user, let's open everything as
+	// read only in order to avoid polluting user directories with root
+	// owned files.
+	readOnly := useUserOciStore && os.Geteuid() == 0
+
+	if readOnly {
+		for _, f := range []string{"index.json", "index.json.lock"} {
+			if _, err := os.Stat(path.Join(ociStorePath, f)); err != nil {
+				return nil, fmt.Errorf("--oci-store-user with root requires user's store (%q) to already exist: %w", ociStorePath, err)
+			}
+		}
+	} else {
+		if err := os.MkdirAll(ociStorePath, 0o700); err != nil {
+			return nil, fmt.Errorf("creating oci store directory %q: %w", ociStorePath, err)
+		}
+	}
+
+	indexPath := path.Join(ociStorePath, "index.json")
+	indexLock := flock.New(path.Join(ociStorePath, "index.json.lock"))
 
 	// lock the file before reading the index below
-	indexLock.RLock()
+	// RLock can't be used since we might create and init an empty index file in oci.New()
+	if err := indexLock.Lock(); err != nil {
+		return nil, fmt.Errorf("locking index file %q: %w", indexLock.Path(), err)
+	}
 	defer indexLock.Unlock()
 
-	ociStore, err := oci.New(defaultOciStore)
+	ociStore, err := oci.New(ociStorePath)
 	if err != nil {
 		return nil, err
 	}
@@ -62,14 +134,18 @@ func newLocalOciStore() (*localOciStore, error) {
 
 	return &localOciStore{
 		Store:      ociStore,
+		storePath:  ociStorePath,
 		indexPath:  indexPath,
 		oldIndex:   oldIndex,
 		indexFlock: indexLock,
+		readOnly:   readOnly,
 	}, nil
 }
 
 func (o *localOciStore) saveIndexWithLock() error {
-	o.indexFlock.Lock()
+	if err := o.indexFlock.Lock(); err != nil {
+		return fmt.Errorf("locking index file %q: %w", o.indexFlock.Path(), err)
+	}
 	defer o.indexFlock.Unlock()
 
 	currentIndex, err := readIndexFile(o.indexPath)

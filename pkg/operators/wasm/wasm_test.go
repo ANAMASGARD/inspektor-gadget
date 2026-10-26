@@ -515,6 +515,7 @@ func TestFiltering(t *testing.T) {
 }
 
 func testFiltering(t *testing.T, path string) {
+	utils.RequireRoot(t)
 	gadgetCtx := createGadgetCtx(t, path, "filtering")
 
 	// Keep in sync with testdata/filtering/program.go
