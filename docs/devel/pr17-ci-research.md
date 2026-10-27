@@ -253,3 +253,53 @@ All scans retain `HIGH/CRITICAL`, `ignore-unfixed=true` and `exit-code=1`;
 zero qualifying findings does not imply absence of unfixed vulnerabilities.
 The unchanged DNS/benchmark Alpine 3.18 runtime bases still produce EOL warnings.
 The PR description records the newest pushed head and its exact check results.
+
+### Subsequent full-run audit
+
+Run [40481918417](https://github.com/kubescape/inspektor-gadget/actions/runs/40481918417)
+at `851d8f2632bb795c54e4df30edf7f20668bcaf44` completed the runner, formatter,
+native operator-fixture and sudo-environment repairs. Standard unit tests,
+ordinary gadget unit tests and all seven VM kernels passed: 3,137 test/subtest
+passes and 59 explicit skips in those nine jobs. Every ordinary/guest gadget
+job verified the same signed local image and exercised all 40 exec cases,
+profile_cpu, capability, offline-reuse and TTY tests without panics.
+The [native companion](https://github.com/kubescape/inspektor-gadget/actions/runs/40481918454)
+passed on AMD64 (483 passes, three skips) and ARM64 (482 passes, three skips),
+including all seven privileged packages, the empty/operator kernel-stack
+fixtures, and 54 exec test/subtest passes with 780 glibc/musl attempts per
+architecture and no exec skips.
+
+Strict eBPF regeneration and all nine image scan steps passed again. Benchmarks
+executed all 259 packages, 11 families and 18 timing rows, with 83 GiB free
+afterward. All five separate CLI lifecycle/enrichment jobs passed. The five
+gadget integration jobs executed real tests with no missing-IG_PATH skips:
+local containerd and all three Kubernetes runtimes passed, while local Docker
+had 34 passes, two skips and the duration-assertion failure described below.
+Dependency review still failed on repository configuration; this is not an
+overall green CI run. The signed Kubernetes claim also requires the helper
+repair below: a passing job alone did not establish that policy was retained.
+
+Two further inherited test-harness issues were isolated from these logs:
+
+- **FSSlower duration:** all five expected `cat`/`foo`/`F_OPEN` records were
+  present, but their `delta_us` was zero. The BPF program divides nanoseconds by
+  1,000, so sub-microsecond operations validly round to zero with `--min=0`.
+  The test now distinguishes missing/null duration from a present zero using
+  a pointer, while retaining all identity, path and operation assertions.
+  Replaying the actual source callback against those five records reproduces
+  the old failure and passes after the fix; positive, absent, null, wrong-file
+  and wrong-operation controls give all 20 expected outcomes. Package
+  compilation and vet pass. Production tracing is unchanged.
+- **Multitenancy configuration:** both redeployment and restoration supplied
+  `operator.oci.verify-image=false` even when `GADGET_DAEMON_CONFIG` specified
+  verification and a public key. The deploy command applies explicit settings
+  after the file, so that fallback disabled the intended policy. The shared
+  test helper now adds it only when no file is supplied. Four shell-argument
+  regression cases cover both paths with/without configuration, including a
+  path containing spaces: both configured cases fail before the repair, and
+  all four pass with the race detector afterward. Full Kubernetes integration
+  package compilation and vet pass. No production verification or TLS policy
+  changes. Hosted signed Kubernetes execution must validate this repair.
+
+The PR description and external validation handoff record the pushed revision
+and subsequent hosted outcomes for these final test-harness changes.

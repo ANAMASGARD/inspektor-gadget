@@ -17,7 +17,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,10 +36,7 @@ func TestMultiTenancyTokenReviewNamespacePolicy(t *testing.T) {
 	teamB := GenerateTestNamespaceName("mt-team-b")
 	instanceName := GenerateTestNamespaceName("mt-snapshot")
 	gadgetImage := fmt.Sprintf("%s/snapshot_process:%s", *gadgetRepository, *gadgetTag)
-	daemonConfigFlag := ""
-	if configFile := os.Getenv("GADGET_DAEMON_CONFIG"); configFile != "" {
-		daemonConfigFlag = "--daemon-config=" + q(configFile)
-	}
+	daemonConfigFile := os.Getenv("GADGET_DAEMON_CONFIG")
 
 	cleanupCommands := []TestStep{
 		&Command{
@@ -49,15 +45,8 @@ func TestMultiTenancyTokenReviewNamespacePolicy(t *testing.T) {
 			Cleanup: true,
 		},
 		&Command{
-			Name: "Restore non-multi-tenant Inspektor Gadget",
-			Cmd: fmt.Sprintf(`ig_image="$(kubectl -n gadget get daemonset gadget -o jsonpath='{.spec.template.spec.containers[0].image}')"
-%[1]s undeploy || true
-%[1]s deploy --experimental --debug \
-  --image="$ig_image" \
-  --image-pull-policy=IfNotPresent \
-  --set-daemon-config=operator.oci.verify-image=false %[2]s`,
-				q(kubectlGadget), daemonConfigFlag,
-			),
+			Name:    "Restore non-multi-tenant Inspektor Gadget",
+			Cmd:     multiTenancyDeployCommand(kubectlGadget, daemonConfigFile, false),
 			Cleanup: true,
 		},
 		&Command{
@@ -75,20 +64,12 @@ func TestMultiTenancyTokenReviewNamespacePolicy(t *testing.T) {
 	commands := []TestStep{
 		&Command{
 			Name: "Deploy Inspektor Gadget with TokenReview",
-			Cmd: fmt.Sprintf(`ig_image="$(kubectl -n gadget get daemonset gadget -o jsonpath='{.spec.template.spec.containers[0].image}')"
-%[1]s undeploy || true
-%[1]s deploy --experimental --debug \
-  --image="$ig_image" \
-  --image-pull-policy=IfNotPresent \
-  --set-daemon-config=operator.oci.verify-image=false \
-  --set-daemon-config=multi-tenancy=true %[2]s
+			Cmd: multiTenancyDeployCommand(kubectlGadget, daemonConfigFile, true) + `
 kubectl create clusterrolebinding gadget-multitenancy-test-auth-delegator \
   --clusterrole=system:auth-delegator \
   --serviceaccount=gadget:gadget \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl rollout status daemonset/gadget -n gadget --timeout=120s`,
-				q(kubectlGadget), daemonConfigFlag,
-			),
 		},
 		CreateTestNamespaceCommand(teamA),
 		CreateTestNamespaceCommand(teamB),
@@ -218,8 +199,4 @@ EOF`, namespace)
 		Name: fmt.Sprintf("Create team RBAC in %s", namespace),
 		Cmd:  cmd,
 	}
-}
-
-func q(s string) string {
-	return strconv.Quote(s)
 }
