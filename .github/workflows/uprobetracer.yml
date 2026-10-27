@@ -55,12 +55,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Avoid the Azure kernel regression: actions/runner-images#15003.
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             multiarch: x86_64-linux-gnu
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             multiarch: aarch64-linux-gnu
     runs-on: ${{ matrix.runner }}
     env:
@@ -98,5 +99,5 @@ jobs:
           go test -buildvcs=false -exec "sudo -n env PATH=$PATH GOTOOLCHAIN=local SYMSTREAM_CORPUS=$SYMSTREAM_CORPUS GADGET_REPOSITORY=localhost/ig1050 GADGET_TAG=test IG_VERIFY_IMAGE=false" \
             -count=1 -v -timeout=15m \
             ./pkg/uprobetracer ./pkg/container-hook ./pkg/kfilefields \
-            ./pkg/container-collection ./pkg/tracer-collection \
+            ./pkg/container-collection ./pkg/tracer-collection ./pkg/operators/ebpf \
             ./gadgets/trace_exec/test/unit

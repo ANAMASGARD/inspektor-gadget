@@ -10,7 +10,7 @@ are preserved.
 
 | Check | Evidence and repair |
 | --- | --- |
-| ARM64 fork tests | The [maintainer's requested change](https://github.com/kubescape/inspektor-gadget/pull/17#discussion_r4385779833) identifies three stale fixtures. Both `accept` expectations are now 202, and an unknown name expects `(0, false)`. Production syscall tables and the native ARM64 job remain unchanged. |
+| ARM64 fork tests | The [maintainer's requested change](https://github.com/kubescape/inspektor-gadget/pull/17#discussion_r4385779833) identifies three stale fixtures. Both `accept` expectations are now 202, and an unknown name expects `(0, false)`. Production syscall tables are unchanged and native ARM64 coverage is retained. |
 | Benchmarks | The [original job](https://github.com/kubescape/inspektor-gadget/actions/runs/40375996962/job/121759100985) exhausted disk space during compilation but succeeded because `tee` masked the error. Explicit Bash enables `pipefail`; running the same package list sequentially with `-p 2` bounds temporary build storage. Disk diagnostics make future capacity failures visible. |
 | Benchmark and DNS helper images | [Benchmark](https://github.com/kubescape/inspektor-gadget/actions/runs/40375996962/job/121759149077) and [DNS](https://github.com/kubescape/inspektor-gadget/actions/runs/40375996962/job/121759149228) builds succeeded, then Trivy rejected Go 1.26.6 and `golang.org/x/net` 0.59.0. Builders use Go 1.26.10; the module graphs use x/net 0.60.0. |
 | Gadget-builder image | The [scan](https://github.com/kubescape/inspektor-gadget/actions/runs/40375996962/job/121759149212) reported the same Go vulnerabilities in installed tools, with no qualifying Debian findings. Its source toolchain is updated to Go 1.26.10. |
@@ -69,12 +69,38 @@ Makefile invocations now preserve those named settings explicitly. Four real
 Makefile dispatch controls failed before this change and passed afterward,
 with eight additional `SUDO` override controls passing.
 
-The standard unit job also lost container-hook events and WASM perf records
-on Ubuntu 26.04/kernel 7.0. Exact upstream v0.57 validation and the fork's
-native AMD64/ARM64 jobs pass those cases on Ubuntu 24.04; unchanged perf
-cases pass locally too. That job is now pinned to the Ubuntu 24.04 baseline,
-with all tests retained. This does not establish the precise missing-event
-mechanism or claim Ubuntu 26.04 compatibility.
+The later integration jobs exposed the same sudo boundary: their green
+results contained 37 skipped gadget tests each because `IG_PATH` was missing.
+Both integration recipes now preserve the named CLI/runtime/image/signature
+inputs and export the default `IG_RUNTIME` explicitly. Six negative controls
+reproduced the missing-input skips; 36 positive dispatch/override controls
+passed, including real GNU sudo and multiline key/flag values. Hosted workload
+execution must still confirm these tests actually run.
+
+The host's missing container-hook, exec/open and WASM events now have a
+primary-source explanation: the affected runner image uses Azure kernel
+7.0.0-1017 with the syscall-enter tracepoint regression confirmed in
+[runner-images #15003](https://github.com/actions/runner-images/issues/15003).
+Identical signed gadgets and userspace pass the exec/open tests under all seven
+VM kernels, while the ordinary host drops events. The successful Ubuntu 24.04
+unit run used the older 6.17 image; newer 24.04 images also carry the bad kernel.
+Following [upstream's merged workaround](https://github.com/inspektor-gadget/inspektor-gadget/pull/5891),
+the main workflow and both native runners use Ubuntu 22.04 temporarily. The
+supported native `ubuntu-22.04-arm` image uses kernel 6.8. All seven guest-kernel
+versions and all tests remain enabled. Revisit this pin when the runner kernel
+is fixed; Ubuntu 22.04 runner retirement is scheduled for April 2027.
+
+The broader suite also exposed an inherited fork panic in kernel-stack
+formatting: fork commit `3c163e75e` disabled `NewKAllSyms` initialization while
+retaining a method bound to the nil resolver. The repair loads one shared,
+concurrency-safe symbol snapshot per formatter instance only after a nonempty
+stack is fetched. Disabled, empty and missing stacks retain the fork's avoidance
+of that work. Initialization failures are cached and handled through the
+existing formatter error path; no global cache or extra file lifetime is added.
+A native test reproduced the old panic and passed after repair. The full
+affected-package race suite passed 75 tests/subtests with two skips; the new
+native case passed separately as root. Tests cover concurrent initialization,
+instance isolation, unused stacks, and cached initialization failures.
 
 The preserved CI regeneration artifact identified the four object differences
 as BTF forward-declaration ordering only. Every instruction, relocation,
@@ -89,8 +115,10 @@ original pinned builder in CI. The strict regeneration check remains enabled,
 and failed artifacts remain available for future diagnosis.
 The adopted objects passed native AMD64 inode-identity checks and three
 notifier load/close cycles, including exec-event collection, with no descriptor
-growth. Thirty focused package race tests also passed without skips. Fresh
-hosted regeneration and native ARM64 execution remain required for these bytes.
+growth. Thirty focused package race tests also passed without skips.
+[Strict hosted regeneration](https://github.com/kubescape/inspektor-gadget/actions/runs/40475221222/job/122093417445)
+subsequently reproduced both architectures byte-for-byte at `db99105088`;
+both native architecture workflows passed on that head too.
 
 Ubuntu 26.04's uutils `echo` also rejects some spoofed argv and empty-path
 execveat invocations. The exec regression suite now compiles a no-op target
@@ -171,8 +199,9 @@ short path without a source change.
 - The complete benchmark step passed all 259 package invocations and emitted
   18 result rows covering all 11 existing benchmark families. This local run
   used a warmed cache; hosted cold-cache capacity still requires CI evidence.
-- Native AMD64 exec tests passed 40 tests/subtests and 390 glibc fixture
-  executions. One musl case was skipped because its compiler was unavailable.
+- Initial native AMD64 exec tests passed 40 tests/subtests and 390 glibc fixture
+  executions, with one missing-musl skip. The updated 54-pass glibc/musl run
+  described above supersedes that limited exec result.
   This reused the verified existing exec image, not a newly built artifact.
   Native uprobe tests passed 301 tests/subtests with two skips; three further
   fork packages passed 45 tests/subtests with one overlayfs-environment skip.
@@ -198,3 +227,29 @@ the GPU bridge. The companion native fork run `40470229543` passed unit/race,
 vet, and kernel symbol tests on both native architectures. These results
 precede the formatting/QEMU follow-up; the PR description records the latest
 revision's status and any remaining runtime requirements.
+
+Hosted run [40475221222](https://github.com/kubescape/inspektor-gadget/actions/runs/40475221222)
+at `db99105088cac2a47c6406c8d3985cf32ee0855c` passed strict object regeneration,
+all nine architecture-specific image scans, all 259 benchmark package invocations
+and 11 benchmark families (84 GiB free afterward), and standard unit tests
+(1,929 passing tests/subtests, 17 skips). Its native companion
+[40475221227](https://github.com/kubescape/inspektor-gadget/actions/runs/40475221227)
+passed both architectures, including 54 exec test/subtest events and 780
+glibc/musl attempts per architecture, with no exec skips. Three other native
+cases skipped for self-map_files access, a Go-version-specific oracle, and
+unavailable real overlayfs fixtures.
+
+All seven VM kernels passed 40 exec tests/subtests each, with one missing-musl
+skip. Their workflows nevertheless failed on the nil-resolver panic, while
+host runtime jobs also exposed the kernel regression and silent integration
+skips described above. Thus this run is not an overall CI pass. Fresh hosted
+validation remains required for the subsequent formatter, integration-environment
+and runner repairs.
+
+The final GPU artifact from that run has the exact config and all 16 layers of
+the previously inspected image. Its nine OpenSSL payload files, matching package
+metadata/licenses, Go 1.26.10 binary and restricted startup controls are verified.
+All scans retain `HIGH/CRITICAL`, `ignore-unfixed=true` and `exit-code=1`;
+zero qualifying findings does not imply absence of unfixed vulnerabilities.
+The unchanged DNS/benchmark Alpine 3.18 runtime bases still produce EOL warnings.
+The PR description records the newest pushed head and its exact check results.
