@@ -86,7 +86,7 @@ jobs:
         run: go vet ./pkg/uprobetracer ./pkg/operators/ebpf ./pkg/utils/syscalls ./pkg/testing/gadgetrunner
       - name: Kernel symbol lookup and capture tests
         run: go test -exec 'sudo -n' -count=1 -v -timeout=5m ./pkg/uprobetracer -run '^(TestCachedSymbolKernelCapture|TestCachedSymbolMatchesCilium)$'
-      - name: Build the fork CLI and exec gadget
+      - name: Build the fork CLI and native test gadgets
         env:
           BUILDER_IMAGE: ghcr.io/inspektor-gadget/gadget-builder@sha256:1586c58ae4731fb8fb12546c031a352db34c0ce334709b9b54e6c648edae76ad
         run: |
@@ -94,6 +94,10 @@ jobs:
           sudo IG_SOURCE_PATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ig" image build \
             --builder-image "$BUILDER_IMAGE" --builder-image-pull=missing \
             -t localhost/ig1050/trace_exec:test gadgets/trace_exec
+          sudo IG_SOURCE_PATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ig" image build \
+            --builder-image "$BUILDER_IMAGE" --builder-image-pull=missing \
+            -t empty:latest pkg/operators/ebpf/testdata/empty
+          sudo "$RUNNER_TEMP/ig" image export empty:latest pkg/operators/ebpf/testdata/empty.tar
       - name: Native fork and exec kernel regressions
         run: |
           go test -buildvcs=false -exec "sudo -n env PATH=$PATH GOTOOLCHAIN=local SYMSTREAM_CORPUS=$SYMSTREAM_CORPUS GADGET_REPOSITORY=localhost/ig1050 GADGET_TAG=test IG_VERIFY_IMAGE=false" \
