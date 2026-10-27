@@ -35,11 +35,11 @@ type traceFSSlowerEvent struct {
 	Timestamp string        `json:"timestamp"`
 	Proc      utils.Process `json:"proc"`
 
-	Delta  uint64 `json:"delta_us"`
-	Offset uint64 `json:"offset"`
-	Size   uint64 `json:"size"`
-	Op     string `json:"op"`
-	File   string `json:"file"`
+	Delta  *uint64 `json:"delta_us"`
+	Offset uint64  `json:"offset"`
+	Size   uint64  `json:"size"`
+	Op     string  `json:"op"`
+	File   string  `json:"file"`
 }
 
 func TestTraceFSSlower(t *testing.T) {
@@ -93,6 +93,7 @@ func TestTraceFSSlower(t *testing.T) {
 
 	runnerOpts = append(runnerOpts, igrunner.WithValidateOutput(
 		func(t *testing.T, output string) {
+			delta := uint64(utils.NormalizedInt)
 			expectedEntry := &traceFSSlowerEvent{
 				CommonData: utils.BuildCommonData(containerName, commonDataOpts...),
 				Proc:       utils.BuildProc("cat", 0, 0),
@@ -103,14 +104,18 @@ func TestTraceFSSlower(t *testing.T) {
 
 				// Check the existence of the following fields
 				Timestamp: utils.NormalizedStr,
-				Delta:     utils.NormalizedInt,
+				Delta:     &delta,
 			}
 
 			normalize := func(e *traceFSSlowerEvent) {
 				utils.NormalizeCommonData(&e.CommonData)
 				utils.NormalizeString(&e.Timestamp)
 				utils.NormalizeProc(&e.Proc)
-				utils.NormalizeInt(&e.Delta)
+				// Sub-microsecond operations round down to zero with --min=0.
+				// Preserve nil so a missing or null duration still fails to match.
+				if e.Delta != nil {
+					*e.Delta = utils.NormalizedInt
+				}
 			}
 
 			match.MatchEntries(t, match.JSONMultiObjectMode, output, normalize, expectedEntry)
