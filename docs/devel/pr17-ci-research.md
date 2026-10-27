@@ -151,26 +151,45 @@ is complete. Workspace headers remain the input to in-tree regeneration.
 
 ## External requirements
 
-- **DCO:** the [check](https://github.com/kubescape/inspektor-gadget/pull/17/checks?check_run_id=121759136244)
-  cannot evaluate the complete commit set. Independent GraphQL pagination
-  returned 100, 100, and 50 commits despite `totalCount: 994`, with no next page.
-  The integration merge has the correct author-matching sign-off. A local
-  trailer audit also identified two imported human-authored non-merge commits,
-  `2241184f2179af5f926370c30cf92a30e4020024` and
-  `fee0b62beed74738d26253f9266067f80b1a289e`, without trailers. This audit is not
-  a replacement for the [DCO app's policy evaluation](https://github.com/dcoapp/app).
-  Complete evaluation and any historical remediation require maintainer/app
-  operator handling; no third-party sign-offs are fabricated.
-- **Dependency review:** the [job](https://github.com/kubescape/inspektor-gadget/actions/runs/40375996962/job/121759100247)
-  fails before evaluating dependencies. A repository administrator must
-  [enable Dependency Graph](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/enable-dependency-graph)
-  and rerun the check after graph population. The workflow remains enabled.
-- **CodeQL:** the [open TLS finding](https://github.com/kubescape/inspektor-gadget/security/code-scanning/1)
-  concerns upstream's kubelet connection. The maintainer reviewed it, and the
-  [upstream discussion](https://github.com/inspektor-gadget/inspektor-gadget/pull/5343#issuecomment-5128360990)
-  records the trust tradeoff. This repair preserves that behavior and leaves
-  formal security disposition to maintainers. It does not suppress or dismiss
-  the alert, or restore the broader `nodes/proxy` permission.
+- **DCO:** the [check](https://github.com/kubescape/inspektor-gadget/pull/17/checks?check_run_id=122127019175)
+  still cannot evaluate the complete commit set. At `a7b8df0581`, independent
+  GraphQL pagination returned 100, 100, and 50 commits despite
+  `totalCount: 1008`, with no next page. Paginated REST comparison of the pinned
+  base and head returned all 1,008 unique SHAs in eleven pages, exactly matching
+  local `git rev-list BASE..HEAD`. The app operator must implement complete
+  retrieval, verify uniqueness/counts and unchanged PR revisions, and retain
+  the existing DCO rules. See the [comparison API](https://docs.github.com/en/rest/commits/commits#compare-two-commits)
+  and [app retrieval code](https://github.com/dcoapp/app/blob/828cc0b29a141821ddecd674bca0d8e634234c18/index.js#L273-L417).
+  The installed app revision is not independently exposed by the check.
+  The integration merge and fourteen repairs through that head have matching
+  Gaurav Chaudhary sign-offs. The local audit identified imported non-merge
+  commits `2241184f2179af5f926370c30cf92a30e4020024` and
+  `fee0b62beed74738d26253f9266067f80b1a289e` without trailers, plus
+  `7a0035af5d0e5073dff8ef52ec16eb076526c7c4` with a differing author/trailer
+  name. These are potential follow-on findings, not the present retrieval
+  failure. Maintainers must enable individual remediation on the default branch
+  (`require.members: true`, `allowRemediationCommits.individual: true`,
+  `allowRemediationCommits.thirdParty: false`), then obtain genuine commits from
+  the original authors using the [required statement and identity](https://github.com/dcoapp/app#individual-remediation-commit-support).
+  Comments alone do not remediate commits. No imported history is rewritten
+  and no original-author approval or sign-off is fabricated.
+- **Dependency review:** the [job](https://github.com/kubescape/inspektor-gadget/actions/runs/40485757415/job/122127005316)
+  fails before evaluating dependencies. The authenticated comparison API
+  independently returned HTTP 403 (request ID
+  `63A0:47D6A:EFF160:15388F1:6AE08366`, 2026-10-27 10:56:38 UTC).
+  The [pinned action](https://github.com/actions/dependency-review-action/blob/a1d282b36b6f3519aa1f3fc636f609c47dddb294/src/main.ts#L267-L280)
+  maps a public-repository 403 to its Dependency Graph message; that does not
+  independently establish that the settings toggle is disabled. An administrator
+  must inspect the [settings and access requirements](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/enable-dependency-graph),
+  enable/index the graph if necessary, or investigate organization policy and
+  GitHub service behavior if already enabled. Confirm successful comparison,
+  then rerun and assess actual findings. Current credentials lack administrator
+  access. The workflow and security policy remain enabled.
+- **CodeQL:** the inherited [TLS finding](https://github.com/kubescape/inspektor-gadget/security/code-scanning/1)
+  is now addressed by verified kubelet discovery, described below. This
+  supersedes the earlier decision to retain upstream's insecure connection.
+  A fresh hosted analysis must confirm the result on the pushed repair.
+  There is no suppression, automatic dismissal, or broader `nodes/proxy` grant.
 
 ## Validation
 
@@ -303,3 +322,87 @@ Two further inherited test-harness issues were isolated from these logs:
 
 The PR description and external validation handoff record the pushed revision
 and subsequent hosted outcomes for these final test-harness changes.
+
+### Verified kubelet discovery and socket fallback
+
+The remaining CodeQL annotation at `a7b8df0581` identified the inherited
+`InsecureSkipVerify` kubelet transport. A local reproduction using an untrusted
+TLS server demonstrated that the old transport delivered a dummy bearer token
+to its HTTP handler. The new transport uses an explicit operator-supplied PEM
+CA bundle and normal chain/identity verification. An empty bundle disables
+discovery before node or token access. An optional literal server identity
+overrides verification of the selected node IP. The Kubernetes API server CA
+is not assumed to sign kubelet serving certificates, and certificates obtained
+from an unverified server are not accepted as trust anchors. See
+[Go TLS configuration](https://pkg.go.dev/crypto/tls#Config) and
+[Kubernetes kubelet TLS bootstrapping](https://kubernetes.io/docs/reference/access-authn-authz/kubelet-tls-bootstrapping/).
+
+The transport retains TLS 1.2 minimum, disables proxies, rejects redirects,
+uses a five-second discovery deadline including its Node lookup, and rejects
+responses exceeding 5 MiB. It supports IPv6, reads the projected token on each
+request, and closes response bodies and idle connections. The existing later
+Node read in `NewK8sClient` is unchanged; the discovery deadline is not a new
+deadline for the entire constructor. Failed discovery never retries with
+certificate verification disabled.
+
+Before relying on fallback, socket selection was repaired to choose verified
+discovery, daemon configuration, legacy environment, then built-in default,
+and only then resolve the selected absolute host path beneath `host.HostRoot`.
+The baseline test reproduced an unprefixed configured path under `/host`.
+Docker retains its separate fixed CRI endpoint; its Engine API setting is not
+repurposed as a CRI socket. Public function signatures and runtime constructors
+are unchanged.
+
+Daemon keys `kubelet-ca-bundle` and `kubelet-server-name` and Helm values
+`config.kubeletCABundle` and `config.kubeletServerName` default to empty strings.
+Quoted YAML preserves multiline PEM through both ConfigMap layers. The embedded
+manifest was regenerated. The installation guide documents migration, daemon
+YAML/Helm `--set-file`, the CSV scalar-override limitation, host socket paths,
+and restarting the DaemonSet after trust changes. Existing RBAC, mounts and
+gadget signature verification are unchanged.
+
+Local validation on Linux AMD64 with Go 1.26.10:
+
+- The final affected-package race suite passed **174 tests/subtests**, with
+  three explicit pre-existing runtime/privilege skips and no failures across
+  ten test-bearing packages. Six additional packages had no test files.
+  The TLS-only suite passed **42 tests/subtests with zero skips** both normally
+  and with the race detector. An independent focused TLS/socket race run passed
+  104 test/subtest events with zero skips; these overlap the broader total.
+- Security controls cover trusted IP/DNS/multiple roots, wrong CA/name, expired
+  certificates, invalid/empty PEM, TLS versions, redirects, proxy variables,
+  IPv6, caller cancellation, the actual production five-second Node deadline,
+  token replacement, response limits/errors and connection cleanup. Rejected
+  peers receive no HTTP request or bearer token. Socket tests cover all four
+  precedence levels, invalid paths/symlinks, `/` and `/host`, and Docker CRI.
+- Config/deploy race tests passed 19 test/subtest events without skips. Six
+  Helm render/schema/equivalence controls and default/custom Helm lint passed.
+  Repeating canonical manifest generation produced identical bytes; only the
+  two intended empty defaults differ from the previous manifest.
+- Affected-package vet, scoped golangci-lint, formatting and whitespace checks
+  passed. All production `cmd`, `pkg`, `internal` and `gadgets` packages built
+  for native AMD64 and cross-built for ARM64. An initial `go build ./...` failed
+  because the existing `integration/k8s` test executable has no ordinary
+  `main`; this is not recorded as a successful whole-tree build. Cross-building
+  does not establish native ARM64 runtime correctness.
+- A task-owned Kubernetes v1.35.1/containerd cluster exercised the real
+  configuration loader, public `NewK8sClient` and `ListContainers`. Trusted IP
+  and DNS cases succeeded despite deliberately invalid fallback settings,
+  proving authenticated discovery. Empty CA, wrong CA and wrong identity cases
+  used the valid configured fallback despite an invalid legacy environment
+  override. Each of all five cases enumerated nine real containers through
+  `/host/run/containerd/containerd.sock`; empty trust produced zero kubelet TCP
+  packets. The final fresh service account had `nodes/configz` allowed and
+  `nodes/proxy` explicitly denied. An initial broader test fixture was replaced
+  and all five cases rerun; only the narrow-permission rerun supports this
+  privilege claim. The isolated cluster/image were removed, preserving existing
+  clusters and user kubeconfig. This is production client integration evidence,
+  not a full gadget DaemonSet or all-distribution test.
+
+Raw baseline/fixed logs, source and binary fingerprints, Helm round-trips,
+cluster probes, packet captures and unposted operator/author requests are
+retained locally in `ig-pr17-tls-validation-2026-10-27` beside the checkout.
+Fresh hosted CodeQL, architecture, kernel and integration results must be
+evaluated on the pushed security repair; earlier green jobs do not validate it.
+The PR remains draft pending those results, the two external gates above and
+maintainer reassessment of the already passing ARM64/reproducibility requests.

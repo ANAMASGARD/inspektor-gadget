@@ -327,6 +327,8 @@ daemon-log-level: info
 docker-socketpath: /run/docker.sock
 events-buffer-length: 16384
 gadget-namespace: gadget
+kubelet-ca-bundle: ""
+kubelet-server-name: ""
 operator:
   kubemanager:
     fallback-podinformer: true
@@ -350,8 +352,65 @@ podman-socketpath: /run/podman/podman.sock
 
 ##### Container Runtime Socket Path Detection
 
-Inspektor Gadget automatically detects the container runtime socket path by
-querying the kubelet's `/configz` endpoint on each node. This requires the
+Inspektor Gadget can detect the container runtime socket path by querying the
+kubelet's `/configz` endpoint on each node over verified TLS. Discovery is
+disabled by default: an empty `kubelet-ca-bundle` skips the kubelet request and
+uses the configured runtime socket paths.
+
+To enable discovery, supply the PEM CA bundle that signs your kubelet serving
+certificates. This may differ from the Kubernetes API server's CA. Obtain the
+bundle from your cluster administrator; a certificate fetched from an
+unverified kubelet endpoint does not establish trust. The bundle is PEM content,
+not a filename, in the daemon configuration:
+
+```yaml
+kubelet-ca-bundle: |
+  -----BEGIN CERTIFICATE-----
+  ... replace with your kubelet CA certificate ...
+  -----END CERTIFICATE-----
+kubelet-server-name: ""
+```
+
+The default certificate identity is the node IP used for the connection, so
+the serving certificate must include that IP in its subject alternative names.
+If the certificate instead uses a DNS name, set `kubelet-server-name` to that
+literal DNS name. This changes the identity checked by TLS, not the destination
+node IP. It is not a template: node-name placeholders and wildcards are not
+expanded.
+
+Deploy with `kubectl gadget deploy --daemon-config=daemon-config.yaml`. When
+using Helm, read the PEM directly from a local file:
+
+```bash
+helm upgrade --install gadget gadget/gadget --namespace=gadget --create-namespace \
+  --set-file config.kubeletCABundle=./kubelet-ca.pem \
+  --set-string config.kubeletServerName=kubelet.internal.example
+```
+
+Use daemon YAML or Helm `--set-file` for multiline PEM. The deploy command's
+`--set-daemon-config` flag uses CSV parsing and is intended for scalar settings,
+such as `--set-daemon-config=kubelet-server-name=kubelet.internal.example`.
+To disable discovery explicitly, use `--set-daemon-config=kubelet-ca-bundle=`.
+
+Omit the server-name override when the serving certificate has the node IP as
+a subject alternative name. Both Helm values default to empty strings. The
+settings use the existing ConfigMap configuration; they add no Secret mounts
+or automatic environment-variable bindings. They do not change gadget-image
+signature verification or its public keys.
+
+**Migration:** earlier versions queried `/configz` without verifying the
+kubelet certificate. To retain discovery, configure the kubelet CA and, if
+needed, its DNS identity. Otherwise, verify that the configured runtime socket
+paths below match your nodes. Invalid trust material or certificate verification
+failure leaves discovery unavailable and uses those paths; it does not retry
+with TLS verification disabled. Restart the gadget DaemonSet after updating
+the CA bundle or server name so the daemon reloads its configuration:
+
+```bash
+kubectl rollout restart daemonset/gadget -n gadget
+```
+
+Discovery also requires the
 `nodes/configz` RBAC permission, which is granted automatically on clusters
 running Kubernetes v1.33 or later (where fine-grained kubelet API authorization
 is enabled by default, see
@@ -360,15 +419,17 @@ is enabled by default, see
 On older clusters (before v1.33), or on distributions where the kubelet API
 authorization feature gate has been explicitly disabled, socket path
 auto-detection is not available. Inspektor Gadget will log a warning and fall
-back to the configured socket path:
+back to the configured socket path. No `nodes/proxy` permission is required or
+added. For example, a cluster that denies `/configz` reports:
 
 ```
-time="2026-08-10T14:36:21Z" level=warning msg="Failed to retrieve socket path for runtime client from kubelet: getting /configz: fetching /configz from \"minikube-docker\": kubelet /configz status is 403, expected: 200. Falling back to default container runtime"
-time="2026-08-10T14:36:21Z" level=warning msg="Failed to retrieve socket path for runtime client from kubelet: getting /configz: fetching /configz from \"minikube-docker\": kubelet /configz status is 403, expected: 200. Falling back to default container runtime"
+time="2026-08-10T14:36:21Z" level=warning msg="Failed to retrieve socket path for runtime client from kubelet: getting /configz: fetching /configz from \"minikube-docker\": kubelet /configz status is 403, expected: 200. Falling back to configured container runtime"
 ```
 
 If the default path does not match your setup, you can set it explicitly in a
-daemon configuration file:
+daemon configuration file. Socket paths are host paths, normally starting with
+`/run/`, and are resolved once beneath `HOST_ROOT`. Do not include the
+container's host mount prefix, such as `/host`, in these settings:
 
 ```yaml
 # daemon-config.yaml

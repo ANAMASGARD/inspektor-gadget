@@ -31,6 +31,8 @@ data:
       podman-socketpath: /run/podman/podman.sock
       gadget-namespace: gadget
       daemon-log-level: info
+      kubelet-ca-bundle: ""
+      kubelet-server-name: ""
       multi-tenancy: false
       multi-tenancy-scope-api-group: ""
       multi-tenancy-scope-resource: pods

@@ -13,6 +13,11 @@ config:
   # -- Podman API Unix socket path
   podmanSocketPath: "/run/podman/podman.sock"
 
+  # -- PEM CA bundle for verifying kubelet /configz TLS. Empty disables socket-path discovery.
+  kubeletCABundle: ""
+  # -- Optional literal DNS name to verify in the kubelet certificate. Empty verifies the node IP.
+  kubeletServerName: ""
+
   # -- Enable experimental features
   experimental: false
 

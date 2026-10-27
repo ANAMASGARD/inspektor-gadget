@@ -18,6 +18,8 @@ data:
       podman-socketpath: {{ .Values.config.podmanSocketPath }}
       gadget-namespace: {{ include "gadget.namespace" . }}
       daemon-log-level: {{ .Values.config.daemonLogLevel }}
+      kubelet-ca-bundle: {{ .Values.config.kubeletCABundle | quote }}
+      kubelet-server-name: {{ .Values.config.kubeletServerName | quote }}
       multi-tenancy: {{ .Values.config.multiTenancy.enabled }}
       multi-tenancy-scope-api-group: {{ .Values.config.multiTenancy.scope.apiGroup | quote }}
       multi-tenancy-scope-resource: {{ .Values.config.multiTenancy.scope.resource }}

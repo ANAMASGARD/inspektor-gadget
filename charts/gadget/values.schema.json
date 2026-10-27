@@ -72,6 +72,12 @@
         "podmanSocketPath": {
           "type": "string"
         },
+        "kubeletCABundle": {
+          "type": "string"
+        },
+        "kubeletServerName": {
+          "type": "string"
+        },
         "experimental": {
           "type": "boolean"
         },

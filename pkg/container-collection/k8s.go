@@ -16,28 +16,20 @@ package containercollection
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	securejoin "github.com/cyphar/filepath-securejoin"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
 
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/config"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/config/gadgettracermanagerconfig"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
@@ -54,8 +46,6 @@ type K8sClient struct {
 	RuntimeConfig *containerutilsTypes.RuntimeConfig
 }
 
-const kubeletPort = "10250"
-
 func NewK8sClient(nodeName string, kubeconfigPath string, userAgentComment string) (*K8sClient, error) {
 	clientset, err := k8sutil.NewClientset(kubeconfigPath, userAgentComment)
 	if err != nil {
@@ -66,11 +56,9 @@ func NewK8sClient(nodeName string, kubeconfigPath string, userAgentComment strin
 
 	socketPath, err := getContainerRuntimeSocketPath(clientset, nodeName)
 	if err != nil {
-		log.Warnf("Failed to retrieve socket path for runtime client from kubelet: %v. Falling back to default container runtime", err)
-	} else {
-		socketPath, err = securejoin.SecureJoin(host.HostRoot, socketPath)
-		if err != nil {
-			log.Warnf("securejoin failed: %s. Falling back to default container runtime", err)
+		socketPath = ""
+		if !errors.Is(err, errKubeletDiscoveryDisabled) {
+			log.Warnf("Failed to retrieve socket path for runtime client from kubelet: %v. Falling back to configured container runtime", err)
 		}
 	}
 
@@ -82,11 +70,9 @@ func NewK8sClient(nodeName string, kubeconfigPath string, userAgentComment strin
 	// Get a runtime client to talk to the container runtime handling pods in
 	// this node.
 	list := strings.SplitN(node.Status.NodeInfo.ContainerRuntimeVersion, "://", 2)
-	if socketPath == "" {
-		socketPath, err = getSocketPathFromConfig(types.String2RuntimeName(list[0]))
-		if err != nil {
-			log.Warnf("Failed to retrieve socket path for runtime client from config: %v. Falling back to default container runtime", err)
-		}
+	socketPath, err = resolveK8sRuntimeSocketPath(types.String2RuntimeName(list[0]), socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolving container runtime socket path: %w", err)
 	}
 	runtimeConfig := &containerutilsTypes.RuntimeConfig{
 		Name:            types.String2RuntimeName(list[0]),
@@ -119,20 +105,6 @@ func trimRuntimePrefix(id string) string {
 	}
 
 	return parts[1]
-}
-
-func getSocketPathFromConfig(runtime types.RuntimeName) (string, error) {
-	switch runtime {
-	case types.RuntimeNameDocker:
-		return config.Config.GetString(gadgettracermanagerconfig.DockerSocketPath), nil
-	case types.RuntimeNameContainerd:
-		return config.Config.GetString(gadgettracermanagerconfig.ContainerdSocketPath), nil
-	case types.RuntimeNameCrio:
-		return config.Config.GetString(gadgettracermanagerconfig.CrioSocketPath), nil
-	case types.RuntimeNamePodman:
-		return config.Config.GetString(gadgettracermanagerconfig.PodmanSocketPath), nil
-	}
-	return "", fmt.Errorf("unsupported runtime: %s", runtime)
 }
 
 // GetNonRunningContainers returns the list of containers IDs that are not running.
@@ -261,108 +233,4 @@ func getContainerRuntimeSocketPath(clientset *kubernetes.Clientset, nodeName str
 
 	log.Infof("using the detected container runtime socket path from Kubelet's config: %s", socketPath)
 	return socketPath, nil
-}
-
-func getNodeInternalIP(node *v1.Node) (string, error) {
-	for _, a := range node.Status.Addresses {
-		if a.Type == v1.NodeInternalIP && a.Address != "" {
-			return a.Address, nil
-		}
-	}
-	return "", fmt.Errorf("no internal IP found for node %q", node.Name)
-}
-
-func getCurrentKubeletConfigThroughNodesConfigz(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]byte, error) {
-	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("getting node %q: %w", nodeName, err)
-	}
-
-	nodeIP, err := getNodeInternalIP(node)
-	if err != nil {
-		return nil, fmt.Errorf("getting node internal IP: %w", err)
-	}
-
-	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	if err != nil {
-		return nil, fmt.Errorf("reading service account token: %w", err)
-	}
-
-	// Let's dialog with the kubelet through HTTPS.
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				// We cannot verify the kubelet serving
-				// certificate: there is no portable way to get
-				// the kubelet CA (it depends on the
-				// distribution), and fetching it from the
-				// kubelet itself would only verify the peer
-				// against the cert it just presented.
-				// Proxy is disabled so the request cannot
-				// leave the node; intercepting it requires
-				// host/CNI level control, at which point the
-				// attacker already owns the kubelet and our
-				// privileged pod.
-				// Same trade-off as node-feature-discovery's
-				// topology-updater:
-				// https://github.com/kubernetes-sigs/node-feature-discovery/blob/b35e1db7e862/pkg/nfd-topology-updater/nfd-topology-updater.go#L561-L573
-				// https://github.com/kubernetes-sigs/node-feature-discovery/blob/76e6cc8cc0d5/pkg/utils/kubeconf/kubelet_configz.go#L82
-				InsecureSkipVerify: true, //nolint:gosec
-				ServerName:         nodeName,
-			},
-			Proxy: nil,
-		},
-		Timeout: 5 * time.Second,
-	}
-	url := fmt.Sprintf("https://%s:%s/configz", nodeIP, kubeletPort)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building http request to kubelet %q: %w", url, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+string(token))
-
-	response, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("getting kubelet /configz at %q: %w", url, err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kubelet /configz status is %d, expected: %d", response.StatusCode, http.StatusOK)
-	}
-
-	return io.ReadAll(io.LimitReader(response.Body, 5<<20 /* 5MiB */))
-}
-
-func getCurrentKubeletConfig(clientset *kubernetes.Clientset, nodeName string) (*kubeletconfigv1beta1.KubeletConfiguration, error) {
-	resp, err := getCurrentKubeletConfigThroughNodesConfigz(context.TODO(), clientset, nodeName)
-	if err != nil {
-		return nil, fmt.Errorf("fetching /configz from %q: %w", nodeName, err)
-	}
-
-	kubeCfg, err := decodeConfigz(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	return kubeCfg, nil
-}
-
-// Decodes the http response from /configz and returns the kubelet configuration
-func decodeConfigz(respBody []byte) (*kubeletconfigv1beta1.KubeletConfiguration, error) {
-	// This hack because /configz reports the following structure:
-	// {"kubeletconfig": {the JSON representation of kubeletconfigv1beta1.KubeletConfiguration}}
-	type configzWrapper struct {
-		ComponentConfig kubeletconfigv1beta1.KubeletConfiguration `json:"kubeletconfig"`
-	}
-
-	configz := configzWrapper{}
-	err := json.Unmarshal(respBody, &configz)
-	if err != nil {
-		return nil, err
-	}
-
-	return &configz.ComponentConfig, nil
 }
