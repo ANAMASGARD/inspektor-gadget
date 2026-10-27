@@ -270,7 +270,8 @@ the previously inspected image. Its nine OpenSSL payload files, matching package
 metadata/licenses, Go 1.26.10 binary and restricted startup controls are verified.
 All scans retain `HIGH/CRITICAL`, `ignore-unfixed=true` and `exit-code=1`;
 zero qualifying findings does not imply absence of unfixed vulnerabilities.
-The unchanged DNS/benchmark Alpine 3.18 runtime bases still produce EOL warnings.
+The unchanged DNS Alpine 3.18 runtime base still produces EOL warnings; the
+benchmark runtime uses distroless Debian 12, not its Alpine build stage.
 The PR description records the newest pushed head and its exact check results.
 
 ### Subsequent full-run audit
