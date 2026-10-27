@@ -3,7 +3,7 @@ env:
   IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
   REGISTRY: ghcr.io
   CONTAINER_REPO: ${{ github.repository }}
-  GO_VERSION: 1.26.6
+  GO_VERSION: 1.26.10
   # controller-gen with go >1.21 panics, but we can't update controller-gen itself
   GO_VERSION_DOC_CHECK: 1.21.3
   HELM_VERSION: v3.18.4
@@ -1562,7 +1562,14 @@ jobs:
         echo "github.event.pull_request.head.repo.full_name: $EVENT_PULL_REQUEST_HEAD_REPO_FULL_NAME"
         echo "github.repository: $GITHUB_REPOSITORY"
     - name: Run benchmarks
-      run: go test -exec sudo -bench=. -run=Benchmark ./... | tee output.txt
+      shell: bash
+      run: |
+        df -h . /tmp
+        go list ./... > "$RUNNER_TEMP/benchmark-packages.txt"
+        while IFS= read -r package; do
+          go test -p 2 -exec sudo -bench=. -run=Benchmark "$package"
+        done < "$RUNNER_TEMP/benchmark-packages.txt" 2>&1 | tee output.txt
+        df -h . /tmp
     #- name: Download previous benchmark data
     #  uses: actions/cache@v1
     #  with:
