@@ -35,6 +35,20 @@ distroless `latest` tag did not fix it: the inspected image still contained
 `3.0.20-1~deb12u2`. Retaining OpenSSL also avoids changing the dependency set
 available to host-provided NVML libraries.
 
+## Explicit architecture scans
+
+[Trivy 0.70's OCI reader](https://github.com/aquasecurity/trivy/blob/v0.70.0/pkg/fanal/image/oci.go)
+selects the first descriptor when given an unqualified local OCI layout;
+setting a platform variable does not select ARM64 for this archive path.
+The helper scan preparation verifies manifest/config digests, requires exactly
+one matching Linux image for each architecture, and exposes those descriptors
+at the scan index root without changing content blobs. The two scans then use
+explicit digest-qualified inputs. The ARM64 scan still runs if AMD64 scanning
+fails. Gadget-image scanning also covers both existing architecture archives;
+GPU remains AMD64-only. Eleven fixture controls cover nested indexes,
+attestations, missing/duplicate platforms, config mismatches, corrupt blobs,
+and unsafe digest inputs; all passed, as did workflow lint.
+
 ## Builder artifact verification
 
 The helper workflow scans a freshly built image but uses its default published
@@ -93,6 +107,10 @@ short path without a source change.
   reactor built successfully. Embedded tool metadata confirms x/net 0.60.0.
 - The production packages cross-built successfully for ARM64. This is not
   native ARM64 or kernel execution evidence.
+- Unit results across the corrected temporary-path rerun and the completed
+  signature-puller run cover all 159 test-bearing packages: 1,768 passing
+  tests/subtests and 145 skips. The original full invocation failed only on
+  the long Unix socket fixture path; it is not described as a successful run.
 - The nine-package fork race suite passed: 457 test/subtest passes, 17 skips,
   and no failures. The AMD64 syscall test suite passed; ARM64 fixtures require
   the native hosted job.
@@ -100,15 +118,23 @@ short path without a source change.
   Controlled runs of the exact benchmark script returned 0 for success and
   propagated package-list, first-package, and later-package failures (23, 41,
   and 42), without continuing to later packages.
+- The complete benchmark step passed all 259 package invocations and emitted
+  18 result rows covering all 11 existing benchmark families. This local run
+  used a warmed cache; hosted cold-cache capacity still requires CI evidence.
+- Native AMD64 exec tests passed 40 tests/subtests and 390 glibc fixture
+  executions. One musl case was skipped because its compiler was unavailable.
+  This reused the verified existing exec image, not a newly built artifact.
+  Native uprobe tests passed 301 tests/subtests with two skips; three further
+  fork packages passed 45 tests/subtests with one overlayfs-environment skip.
 - The complete downloaded Debian package matches the pinned SHA256. Its
   version/architecture, all nine payload files, package MD5 manifest, ELF
   dependencies, and license material were checked successfully. Final image
   comparison, GPU startup, and the vulnerability scan require completed builds.
 
 Local container builds encountered stalled base-image or dependency downloads;
-no successful rebuilt-image scan is claimed. The full unit-suite attempt also
-encountered remote signing-image retrieval, and native container-hook tests
-were blocked while obtaining their Docker fixture. Native tests using the
+no successful rebuilt-image scan is claimed. The signed and unsigned GHCR
+signing-image cases eventually passed; native container-hook tests were
+blocked while obtaining their Docker fixture. Native tests using the
 existing local exec image are distinct from rebuilding that image with a new
 builder. Complete hosted unit, image, native ARM64, and kernel results must be
 checked on the pushed revision. Real GPU/NVML execution remains a separate

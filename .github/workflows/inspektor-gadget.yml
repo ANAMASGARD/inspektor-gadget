@@ -1114,7 +1114,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ linux ]
-        platform: [ amd64 ]
+        platform: [ amd64, arm64 ]
     steps:
       - name: Download gadget ${{ matrix.os }} ${{ matrix.platform }} container image as artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1356,16 +1356,30 @@ jobs:
         # We define the build-args only for the gadget-builder, default to empty
         # string for others.
         build-args: ${{ matrix.image.build-args || '' }}
-    - name: Scan ${{ matrix.image.name }} image for CVEs
+    - name: Prepare helper image manifests for scanning
+      id: prepare-scan-images
+      env:
+        IMAGE_LAYOUT: /tmp/${{ matrix.image.name }}
+      run: python3 .github/scripts/prepare-oci-scan.py "$IMAGE_LAYOUT"
+    - name: Scan ${{ matrix.image.name }} amd64 image for CVEs
       uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       with:
-        input: /tmp/${{ matrix.image.name }}
+        input: /tmp/${{ matrix.image.name }}@${{ steps.prepare-scan-images.outputs.amd64 }}
         format: 'table'
         exit-code: 1
         severity: CRITICAL,HIGH
         # uncomment to ignore vulnerabilities
         ignore-unfixed: true
         # ignore-policy: .github/trivy/ignore-policy.yaml
+    - name: Scan ${{ matrix.image.name }} arm64 image for CVEs
+      if: ${{ !cancelled() && steps.prepare-scan-images.outcome == 'success' }}
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        input: /tmp/${{ matrix.image.name }}@${{ steps.prepare-scan-images.outputs.arm64 }}
+        format: 'table'
+        exit-code: 1
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
     - name: Push ${{ matrix.image.name }} image
       id: push-image
       if: ${{ vars.PUSH_HELPERS == 'ENABLE_PUSH_HELPERS' }}
