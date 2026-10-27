@@ -28,6 +28,10 @@ VIMTO ?= vimto
 VIMTO_VM_MEMORY ?= 4096M
 DOCKER ?= docker
 SUDO ?= sudo -E
+# sudo-rs ignores -E, so explicitly preserve the unit-test image and signature
+# settings across both direct execution and vimto. Keep SUDO overrides usable.
+UNIT_TEST_ENV_VARS := GADGET_REPOSITORY,GADGET_TAG,IG_VERIFY_IMAGE,IG_DEBUG_LOGS,IG_PUBLIC_KEY,VIMTO,VIMTO_VM_MEMORY,KERNEL_VERSION
+UNIT_TEST_SUDO ?= $(if $(strip $(SUDO)),$(SUDO) --preserve-env=$(UNIT_TEST_ENV_VARS))
 
 UNIT_TEST_DIR = test/unit
 INTEGRATION_TEST_DIR = test/integration
@@ -270,9 +274,9 @@ test-unit: build
 	VIMTO=$(VIMTO) \
 	VIMTO_VM_MEMORY=$(VIMTO_VM_MEMORY) \
 	$(if $(KERNEL_VERSION), \
-		$(SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
+		$(UNIT_TEST_SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
 		-memory $(VIMTO_VM_MEMORY) -- go test -v ./.../$(UNIT_TEST_DIR)/..., \
-		go test -v -exec '$(SUDO)' ./.../$(UNIT_TEST_DIR)/...)
+		go test -v -exec '$(UNIT_TEST_SUDO)' ./.../$(UNIT_TEST_DIR)/...)
 
 %/test-unit: % phony_explicit
 	# use PATH preservation to find **right** go binary inside vimto as it's run as sudo
@@ -283,9 +287,9 @@ test-unit: build
 	VIMTO=$(VIMTO) \
 	VIMTO_VM_MEMORY=$(VIMTO_VM_MEMORY) \
 	$(if $(KERNEL_VERSION), \
-		$(SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
+		$(UNIT_TEST_SUDO) PATH="$$PATH" $(VIMTO) -kernel $(KERNEL_REPOSITORY):$(KERNEL_VERSION) \
 		-memory $(VIMTO_VM_MEMORY) -- go test -v ./$*/$(UNIT_TEST_DIR)/..., \
-		go test -v -exec '$(SUDO)' ./$*/$(UNIT_TEST_DIR)/...)
+		go test -v -exec '$(UNIT_TEST_SUDO)' ./$*/$(UNIT_TEST_DIR)/...)
 
 %/test-integration: % phony_explicit
 	IG_PATH=$(IG_PATH) \

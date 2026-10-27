@@ -61,6 +61,27 @@ It now uses the same pinned Docker QEMU setup action already used by the other
 cross-architecture jobs, restricted to ARM64. This preserves emulated build
 support without relying on an ambiguous distro package name.
 
+The next complete run exposed Ubuntu 26.04 runner differences after those
+jobs became reachable. Its sudo-rs ignores `sudo -E`; the gadget unit and
+kernel-matrix jobs therefore lost the prepared registry, tag and signature
+settings and fetched unrelated upstream `latest` images. The unit-test
+Makefile invocations now preserve those named settings explicitly. Four real
+Makefile dispatch controls failed before this change and passed afterward,
+with eight additional `SUDO` override controls passing.
+
+The standard unit job also lost container-hook events and WASM perf records
+on Ubuntu 26.04/kernel 7.0. Exact upstream v0.57 validation and the fork's
+native AMD64/ARM64 jobs pass those cases on Ubuntu 24.04; unchanged perf
+cases pass locally too. That job is now pinned to the Ubuntu 24.04 baseline,
+with all tests retained. This does not establish the precise missing-event
+mechanism or claim Ubuntu 26.04 compatibility.
+
+CI reports four embedded object differences, but independent regeneration
+with verified Debian LLVM 18 and the exact published headers reproduces the
+committed bytes twice. The generation job now preserves failed regeneration
+artifacts for direct comparison; it still fails on any drift. No generated
+bytes are replaced without identifying the actual difference.
+
 The helper workflow scans a freshly built image but uses its default published
 builder when helper publication is disabled. Updating the Dockerfile alone
 therefore does not update downstream gadget builds.
