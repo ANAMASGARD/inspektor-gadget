@@ -32,6 +32,10 @@ SUDO ?= sudo -E
 # settings across both direct execution and vimto. Keep SUDO overrides usable.
 UNIT_TEST_ENV_VARS := GADGET_REPOSITORY,GADGET_TAG,IG_VERIFY_IMAGE,IG_DEBUG_LOGS,IG_PUBLIC_KEY,VIMTO,VIMTO_VM_MEMORY,KERNEL_VERSION
 UNIT_TEST_SUDO ?= $(if $(strip $(SUDO)),$(SUDO) --preserve-env=$(UNIT_TEST_ENV_VARS))
+# Integration binaries also need their CLI, runtime, image and signature settings.
+# Preserve named inputs without bypassing sudo's filtering of unsafe variables.
+INTEGRATION_TEST_ENV_VARS := IG_PATH,IG_RUNTIME,CONTAINER_RUNTIME,GPU_EBPF_BRIDGE_PATH,GADGET_REPOSITORY,GADGET_TAG,IG_FLAGS,IG_PUBLIC_KEY,IG_VERIFY_IMAGE,IG_DEBUG_LOGS,TEST_DNS_SERVER_IMAGE,TEST_DNS_CLIENT_IMAGE,KUBERNETES_DISTRIBUTION,KUBECONFIG,DOCKER_HOST,DOCKER_API_VERSION,DOCKER_CERT_PATH,DOCKER_TLS_VERIFY
+INTEGRATION_TEST_SUDO ?= $(if $(strip $(SUDO)),$(SUDO) --preserve-env=$(INTEGRATION_TEST_ENV_VARS))
 
 UNIT_TEST_DIR = test/unit
 INTEGRATION_TEST_DIR = test/integration
@@ -293,13 +297,14 @@ test-unit: build
 
 %/test-integration: % phony_explicit
 	IG_PATH=$(IG_PATH) \
+	IG_RUNTIME=$(IG_RUNTIME) \
 	GPU_EBPF_BRIDGE_PATH=$(GPU_EBPF_BRIDGE_PATH) \
 	CGO_ENABLED=0 \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) \
 	GADGET_TAG=$(GADGET_TAG) \
 	IG_FLAGS="$(IG_FLAGS)" \
 	TEST_DNS_SERVER_IMAGE=$(DNSTESTER_IMAGE) \
-	go test -v -exec '$(SUDO)' ./$*/$(INTEGRATION_TEST_DIR)/...
+	go test -v -exec '$(INTEGRATION_TEST_SUDO)' ./$*/$(INTEGRATION_TEST_DIR)/...
 
 # CI-only gadgets can ship a workload container image built locally from
 # ci/<gadget>/workload/Dockerfile. It is tagged ig-<gadget>:test, e.g.
@@ -322,13 +327,14 @@ $(foreach gadget,$(CI_WORKLOAD_GADGETS),$(eval $(call CI_WORKLOAD_INTEGRATION_PR
 .PHONY: test-integration
 test-integration: build $(addsuffix /workload-image,$(filter $(GADGETS),$(CI_WORKLOAD_GADGETS)))
 	IG_PATH=$(IG_PATH) \
+	IG_RUNTIME=$(IG_RUNTIME) \
 	GPU_EBPF_BRIDGE_PATH=$(GPU_EBPF_BRIDGE_PATH) \
 	CGO_ENABLED=0 \
 	GADGET_REPOSITORY=$(GADGET_REPOSITORY) \
 	GADGET_TAG=$(GADGET_TAG) \
 	IG_FLAGS="$(IG_FLAGS)" \
 	TEST_DNS_SERVER_IMAGE=$(DNSTESTER_IMAGE) \
-	go test -v -exec '$(SUDO)' ./.../$(INTEGRATION_TEST_DIR)/...
+	go test -v -exec '$(INTEGRATION_TEST_SUDO)' ./.../$(INTEGRATION_TEST_DIR)/...
 
 .PHONY: test-local
 test-local: IG_PATH=$(IG)
