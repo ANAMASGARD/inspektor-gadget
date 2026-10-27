@@ -339,15 +339,15 @@ jobs:
         # - latest commit of btfhub
         # - hash of all bpf objects
         key: btfgen-${{ matrix.platform }}-${{ steps.get-btfhub-head.outputs.head }}-${{ hashFiles('pkg/**/*.o') }}
+    - name: Set up QEMU for ARM64
+      if: matrix.platform == 'arm64'
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      with:
+        platforms: arm64
     - name: Build ig-linux-${{ matrix.platform }}
       env:
         GADGET_BUILDER: ${{ needs.build-helper-images.outputs.gadget_builder_image }}
       run: |
-        if [ "${{ matrix.platform }}" = 'arm64' ]; then
-          sudo apt-get update
-          sudo apt-get install qemu-user-static
-        fi
-
         make ig-linux-${{ matrix.platform }}
 
         # Prepare assets for release and actions artifacts

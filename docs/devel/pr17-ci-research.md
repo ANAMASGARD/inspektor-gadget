@@ -51,6 +51,16 @@ and unsafe digest inputs; all passed, as did workflow lint.
 
 ## Builder artifact verification
 
+Once the repaired helper scans passed, later jobs exposed two additional
+failures in [run 40470229460](https://github.com/kubescape/inspektor-gadget/actions/runs/40470229460).
+The eBPF object check stopped on three formatting differences in the native
+exec C fixture; these now match the builder's formatter without changing C
+tokens. The ARM64 CLI job stopped before building because Ubuntu 26.04 exposes
+[`qemu-user-static` as a virtual package with two providers](https://packages.ubuntu.com/resolute/qemu-user-static).
+It now uses the same pinned Docker QEMU setup action already used by the other
+cross-architecture jobs, restricted to ARM64. This preserves emulated build
+support without relying on an ambiguous distro package name.
+
 The helper workflow scans a freshly built image but uses its default published
 builder when helper publication is disabled. Updating the Dockerfile alone
 therefore does not update downstream gadget builds.
@@ -140,3 +150,11 @@ builder. Complete hosted unit, image, native ARM64, and kernel results must be
 checked on the pushed revision. Real GPU/NVML execution remains a separate
 hardware validation requirement. Image scans retain their existing
 HIGH/CRITICAL failure policy; no suppression or bypass was added.
+
+Hosted run `40470229460` at `3d145e19b1177bd4720d9f17e11a4a1bd8533fab`
+subsequently rebuilt all five image families and passed nine architecture
+scans: AMD64 and ARM64 for the three helpers and gadget image, and AMD64 for
+the GPU bridge. The companion native fork run `40470229543` passed unit/race,
+vet, and kernel symbol tests on both native architectures. These results
+precede the formatting/QEMU follow-up; the PR description records the latest
+revision's status and any remaining runtime requirements.

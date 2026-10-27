@@ -42,7 +42,7 @@ int main(int argc, char **argv)
 		return ret;
 	}
 
-	char *args[] = {"probe-argv0", "cold-argument", NULL};
+	char *args[] = { "probe-argv0", "cold-argument", NULL };
 	if (!strcmp(argv[1], "execveat") ||
 	    !strcmp(argv[1], "execveat-empty")) {
 		int empty = !strcmp(argv[1], "execveat-empty");
@@ -64,14 +64,15 @@ int main(int argc, char **argv)
 	char *mapping = mmap(NULL, 3 * size, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (mapping == MAP_FAILED)
 		fail("mmap");
-	char *mapped_args[] = {mapping + size, mapping + size + 64, NULL};
+	char *mapped_args[] = { mapping + size, mapping + size + 64, NULL };
 	const char path[] = "/bin/echo";
 	const char arg0[] = "probe-argv0";
 	const char arg1[] = "cold-argument";
 	if (pwrite(fd, path, sizeof(path), 0) != sizeof(path) ||
 	    pwrite(fd, arg0, sizeof(arg0), size) != sizeof(arg0) ||
 	    pwrite(fd, arg1, sizeof(arg1), size + 64) != sizeof(arg1) ||
-	    pwrite(fd, mapped_args, sizeof(mapped_args), 2 * size) != sizeof(mapped_args))
+	    pwrite(fd, mapped_args, sizeof(mapped_args), 2 * size) !=
+		    sizeof(mapped_args))
 		fail("write backing file");
 	close(fd);
 	for (int i = 0; i < 3; i++)
