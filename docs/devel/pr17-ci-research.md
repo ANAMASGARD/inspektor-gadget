@@ -76,11 +76,30 @@ cases pass locally too. That job is now pinned to the Ubuntu 24.04 baseline,
 with all tests retained. This does not establish the precise missing-event
 mechanism or claim Ubuntu 26.04 compatibility.
 
-CI reports four embedded object differences, but independent regeneration
-with verified Debian LLVM 18 and the exact published headers reproduces the
-committed bytes twice. The generation job now preserves failed regeneration
-artifacts for direct comparison; it still fails on any drift. No generated
-bytes are replaced without identifying the actual difference.
+The preserved CI regeneration artifact identified the four object differences
+as BTF forward-declaration ordering only. Every instruction, relocation,
+`.BTF.ext` record, other ELF section, and generated Go binding is identical.
+Complete BTF comparison also matches after remapping only forward-declaration
+IDs; all names, layouts, references, and non-forward type IDs are unchanged.
+[LLVM 18's BTF emitter](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/lib/Target/BPF/BTFDebug.cpp)
+assigns these IDs while iterating a pointer-keyed fixup map, explaining why
+identical source/header/compiler controls can differ across allocation
+environments. The four files now use the digest-verified bytes from the
+original pinned builder in CI. The strict regeneration check remains enabled,
+and failed artifacts remain available for future diagnosis.
+The adopted objects passed native AMD64 inode-identity checks and three
+notifier load/close cycles, including exec-event collection, with no descriptor
+growth. Thirty focused package race tests also passed without skips. Fresh
+hosted regeneration and native ARM64 execution remain required for these bytes.
+
+Ubuntu 26.04's uutils `echo` also rejects some spoofed argv and empty-path
+execveat invocations. The exec regression suite now compiles a no-op target
+with the selected libc, preserving all argument/path, cold-page, EFAULT and
+execveat cases without depending on distro utility dispatch. Offline-bundle
+setup acquires the configured image before export, then retains the three
+read-only-store load/unload cycles. The complete updated native AMD64 exec
+suite passed 54 tests/subtests with no skips, including 780 traced glibc/musl
+attempts; all 26 direct fixture modes, strict C compilation and vet passed.
 
 The helper workflow scans a freshly built image but uses its default published
 builder when helper publication is disabled. Updating the Dockerfile alone
