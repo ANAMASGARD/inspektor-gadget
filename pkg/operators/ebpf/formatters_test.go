@@ -340,14 +340,14 @@ func TestFetchAndFormatStackTrace(t *testing.T) {
 	}
 }
 
-func lookupByInstructionPointer(addr uint64) string {
+func lookupByInstructionPointer(addr uint64) (string, error) {
 	switch addr {
 	case 0xabcdef:
-		return "funcA"
+		return "funcA", nil
 	case 0x123456:
-		return "funcB"
+		return "funcB", nil
 	default:
-		return "unknown"
+		return "unknown", nil
 	}
 }
 

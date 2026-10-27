@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf/btf"
 
@@ -166,21 +167,13 @@ func getFormattersForEnums(enums []*enum, ds datasource.DataSource, btfSpec *btf
 }
 
 func (i *ebpfInstance) initStackConverter(gadgetCtx operators.GadgetContext) error {
-	var kernelSymbolResolver *kallsyms.KAllSyms = nil
+	lookupKernelSymbol := newKernelSymbolLookup(kallsyms.NewKAllSyms)
 	for _, ds := range gadgetCtx.GetDataSources() {
 		for _, in := range ds.GetFieldsWithTag("type:" + ebpftypes.KernelStackTypeName) {
 			if in == nil {
 				continue
 			}
 			in.SetHidden(true, false)
-
-			//if kernelSymbolResolver == nil {
-			//	var err error
-			//	kernelSymbolResolver, err = kallsyms.NewKAllSyms()
-			//	if err != nil {
-			//		return err
-			//	}
-			//}
 
 			if i.collectionSpec.Maps[ebpftypes.KernelStackMapName] == nil {
 				return errors.New("kernel stack map is not initialized but used. " +
@@ -200,7 +193,7 @@ func (i *ebpfInstance) initStackConverter(gadgetCtx operators.GadgetContext) err
 			converter := func(ds datasource.DataSource, data datasource.Data) error {
 				inBytes := in.Get(data)
 				stackId := ds.ByteOrder().Uint32(inBytes)
-				outString, err := fetchAndFormatStackTrace(stackId, i.kernelStackMap.Lookup, kernelSymbolResolver.LookupByInstructionPointer)
+				outString, err := fetchAndFormatStackTrace(stackId, i.kernelStackMap.Lookup, lookupKernelSymbol)
 				if err != nil {
 					i.logger.Warnf("stack with ID %d is lost: %s", stackId, err.Error())
 					out.Set(data, []byte{})
@@ -215,7 +208,31 @@ func (i *ebpfInstance) initStackConverter(gadgetCtx operators.GadgetContext) err
 	return nil
 }
 
-func fetchAndFormatStackTrace(stackId uint32, stackLookup func(interface{}, interface{}) error, lookupByInstructionPointer func(uint64) string) (string, error) {
+// Keep the expensive symbol snapshot local to the formatter lifecycle and share
+// it across fields. Gadgets with disabled, empty, or missing stacks never load
+// it. Cache initialization failures as well so events cannot trigger repeated
+// reads of /proc/kallsyms.
+func newKernelSymbolLookup(load func() (*kallsyms.KAllSyms, error)) func(uint64) (string, error) {
+	getSymbols := sync.OnceValues(func() (*kallsyms.KAllSyms, error) {
+		symbols, err := load()
+		if err != nil {
+			return nil, fmt.Errorf("loading kernel symbols: %w", err)
+		}
+		if symbols == nil {
+			return nil, errors.New("loading kernel symbols: empty resolver")
+		}
+		return symbols, nil
+	})
+	return func(address uint64) (string, error) {
+		symbols, err := getSymbols()
+		if err != nil {
+			return "", err
+		}
+		return symbols.LookupByInstructionPointer(address), nil
+	}
+}
+
+func fetchAndFormatStackTrace(stackId uint32, stackLookup func(interface{}, interface{}) error, lookupByInstructionPointer func(uint64) (string, error)) (string, error) {
 	stack := [ebpftypes.KernelPerfMaxStackDepth]uint64{}
 	err := stackLookup(stackId, &stack)
 	if err != nil {
@@ -226,7 +243,11 @@ func fetchAndFormatStackTrace(stackId uint32, stackLookup func(interface{}, inte
 		if addr == 0 {
 			break
 		}
-		outString += fmt.Sprintf("%s; ", lookupByInstructionPointer(addr))
+		symbol, err := lookupByInstructionPointer(addr)
+		if err != nil {
+			return "", err
+		}
+		outString += fmt.Sprintf("%s; ", symbol)
 	}
 	return outString, nil
 }
