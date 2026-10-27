@@ -21,7 +21,7 @@ static void fail(const char *operation)
 
 int main(int argc, char **argv)
 {
-	if (argc != 2)
+	if (argc != 3)
 		return 1;
 	if (!strcmp(argv[1], "system"))
 		return system(":") != 0;
@@ -46,10 +46,17 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "execveat") ||
 	    !strcmp(argv[1], "execveat-empty")) {
 		int empty = !strcmp(argv[1], "execveat-empty");
-		int fd = open(empty ? "/bin/echo" : "/bin", O_PATH | O_CLOEXEC);
+		char *directory = strdup(argv[2]);
+		if (!directory)
+			fail("strdup");
+		char *name = strrchr(directory, '/');
+		if (!name)
+			return 1;
+		*name++ = '\0';
+		int fd = open(empty ? argv[2] : directory, O_PATH | O_CLOEXEC);
 		if (fd < 0)
 			fail("open execveat target");
-		syscall(SYS_execveat, fd, empty ? "" : "echo", args, environ,
+		syscall(SYS_execveat, fd, empty ? "" : name, args, environ,
 			empty ? AT_EMPTY_PATH : 0);
 		fail("execveat");
 	}
@@ -65,10 +72,14 @@ int main(int argc, char **argv)
 	if (mapping == MAP_FAILED)
 		fail("mmap");
 	char *mapped_args[] = { mapping + size, mapping + size + 64, NULL };
-	const char path[] = "/bin/echo";
+	size_t path_size = strlen(argv[2]) + 1;
+	if (path_size > (size_t)size) {
+		errno = ENAMETOOLONG;
+		fail("target path");
+	}
 	const char arg0[] = "probe-argv0";
 	const char arg1[] = "cold-argument";
-	if (pwrite(fd, path, sizeof(path), 0) != sizeof(path) ||
+	if (pwrite(fd, argv[2], path_size, 0) != (ssize_t)path_size ||
 	    pwrite(fd, arg0, sizeof(arg0), size) != sizeof(arg0) ||
 	    pwrite(fd, arg1, sizeof(arg1), size + 64) != sizeof(arg1) ||
 	    pwrite(fd, mapped_args, sizeof(mapped_args), 2 * size) !=

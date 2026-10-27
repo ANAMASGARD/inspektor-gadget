@@ -81,6 +81,9 @@ func captureExecFrom(t *testing.T, action func() error, target oras.ReadOnlyTarg
 
 func TestTraceExecOfflineBundle(t *testing.T) {
 	gadgettesting.InitUnitTest(t)
+	// CI serves the configured image from a registry; populate the local store
+	// through the normal loading path before exporting the offline bundle.
+	captureExec(t, func() error { return nil })
 	bundle := filepath.Join(t.TempDir(), "exec.tar")
 	image := gadgetrunner.GetGadgetImageName("trace_exec")
 	require.NoError(t, oci.ExportGadgetImages(context.Background(), bundle, image))
@@ -97,15 +100,30 @@ func TestTraceExecOfflineBundle(t *testing.T) {
 	}
 }
 
+func compileExecFixture(t *testing.T, compiler, source string) string {
+	t.Helper()
+	fixture := filepath.Join(t.TempDir(), strings.TrimSuffix(source, ".c"))
+	args := []string{"-Wall", "-Wextra", "-Werror", "-O2", "-o", fixture, filepath.Join("testdata", source)}
+	if compiler == "musl-gcc" {
+		args = append(args, "-static")
+	}
+	output, err := exec.Command(compiler, args...).CombinedOutput()
+	require.NoError(t, err, "%s", output)
+	resolved, err := filepath.EvalSymlinks(fixture)
+	require.NoError(t, err)
+	return resolved
+}
+
 func TestTraceExecCommittedArguments(t *testing.T) {
 	gadgettesting.InitUnitTest(t)
+	// A dedicated executable accepts every argv shape, independent of the
+	// host distribution's command dispatch or argument validation.
+	target := compileExecFixture(t, "cc", "exec_target.c")
 	dir := t.TempDir()
-	alias := filepath.Join(dir, "echo-link")
-	require.NoError(t, os.Symlink("/bin/echo", alias))
+	alias := filepath.Join(dir, "target-link")
+	require.NoError(t, os.Symlink(target, alias))
 	script := filepath.Join(dir, "script")
 	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-	echoPath, err := filepath.EvalSymlinks("/bin/echo")
-	require.NoError(t, err)
 	shellPath, err := filepath.EvalSymlinks("/bin/sh")
 	require.NoError(t, err)
 	sink, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
@@ -116,19 +134,19 @@ func TestTraceExecCommittedArguments(t *testing.T) {
 		name, path, cwd, exe, file string
 		argv, want                 []string
 	}{
-		{"argv0", "/bin/echo", "", echoPath, echoPath, []string{"spoofed", "value"}, []string{"spoofed", "value"}},
-		{"symlink", alias, "", echoPath, echoPath, []string{"alias-name", "value"}, []string{"alias-name", "value"}},
-		{"relative", "./echo-link", dir, echoPath, echoPath, []string{"relative-name", "value"}, []string{"relative-name", "value"}},
+		{"argv0", target, "", target, target, []string{"spoofed", "value"}, []string{"spoofed", "value"}},
+		{"symlink", alias, "", target, target, []string{"alias-name", "value"}, []string{"alias-name", "value"}},
+		{"relative", "./target-link", dir, target, target, []string{"relative-name", "value"}, []string{"relative-name", "value"}},
 		{"shebang", script, "", shellPath, script, []string{"spoofed-script", "value", ""}, []string{"/bin/sh", script, "value", ""}},
-		{"missing-argv", "/bin/echo", "", echoPath, echoPath, nil, []string{""}},
-		{"empty-argv0", "/bin/echo", "", echoPath, echoPath, []string{"", "value"}, []string{"", "value"}},
-		{"empty", "/bin/echo", "", echoPath, echoPath, []string{"echo", "", "", "tail", ""}, []string{"echo", "", "", "tail", ""}},
-		{"many", "/bin/echo", "", echoPath, echoPath, many, many},
-		{"long", "/bin/echo", "", echoPath, echoPath, []string{"echo", strings.Repeat("x", 1024)}, []string{"echo", strings.Repeat("x", 1024)}},
-		{"exact-buffer", "/bin/echo", "", echoPath, echoPath, []string{"echo", strings.Repeat("x", 5114)}, []string{"echo", strings.Repeat("x", 5114)}},
+		{"missing-argv", target, "", target, target, nil, []string{""}},
+		{"empty-argv0", target, "", target, target, []string{"", "value"}, []string{"", "value"}},
+		{"empty", target, "", target, target, []string{"echo", "", "", "tail", ""}, []string{"echo", "", "", "tail", ""}},
+		{"many", target, "", target, target, many, many},
+		{"long", target, "", target, target, []string{"echo", strings.Repeat("x", 1024)}, []string{"echo", strings.Repeat("x", 1024)}},
+		{"exact-buffer", target, "", target, target, []string{"echo", strings.Repeat("x", 5114)}, []string{"echo", strings.Repeat("x", 5114)}},
 		// An argument whose terminating NUL lies outside the capture block is
 		// omitted by the formatter. It must not turn into a fabricated argv.
-		{"truncated", "/bin/echo", "", echoPath, echoPath, []string{"echo", "prefix", strings.Repeat("x", 6000)}, []string{"echo", "prefix"}},
+		{"truncated", target, "", target, target, []string{"echo", "prefix", strings.Repeat("x", 6000)}, []string{"echo", "prefix"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := captureExec(t, func() error {
@@ -157,19 +175,14 @@ func TestTraceExecLibcColdPages(t *testing.T) {
 			if _, err := exec.LookPath(compiler); err != nil {
 				t.Skipf("%s is required for this libc's kernel regression tests", compiler)
 			}
-			fixture := filepath.Join(t.TempDir(), "exec-fixture")
-			args := []string{"-Wall", "-Wextra", "-Werror", "-O2", "-o", fixture, "testdata/exec.c"}
-			if compiler == "musl-gcc" {
-				args = append(args, "-static")
-			}
-			output, err := exec.Command(compiler, args...).CombinedOutput()
-			require.NoError(t, err, "%s", output)
+			fixture := compileExecFixture(t, compiler, "exec.c")
+			target := compileExecFixture(t, compiler, "exec_target.c")
 			for _, mode := range []string{"warm", "cold-path", "cold-argument", "cold-vector", "cold-all", "unmapped-path", "unmapped-argument", "unmapped-vector", "system", "popen", "wordexp", "execveat", "execveat-empty"} {
 				t.Run(mode, func(t *testing.T) {
 					const attempts = 30
 					events := captureExec(t, func() error {
 						for range attempts {
-							if output, err := exec.Command(fixture, mode).CombinedOutput(); err != nil {
+							if output, err := exec.Command(fixture, mode, target).CombinedOutput(); err != nil {
 								return fmt.Errorf("%s: %w: %s", mode, err, output)
 							}
 						}
