@@ -30,8 +30,6 @@ const (
 	PodmanSocketPath      = "podman-socketpath"
 	GadgetNamespace       = "gadget-namespace"
 	DaemonLogLevel        = "daemon-log-level"
-	KubeletCABundle       = "kubelet-ca-bundle"
-	KubeletServerName     = "kubelet-server-name"
 
 	VerifyImage        = "verify-image"
 	PublicKeys         = "public-keys"
@@ -53,8 +51,6 @@ func Init() error {
 
 	config.Config.SetDefault(EventsBufferLengthKey, 16384)
 	config.Config.SetDefault(DaemonLogLevel, "info")
-	config.Config.SetDefault(KubeletCABundle, "")
-	config.Config.SetDefault(KubeletServerName, "")
 	config.Config.SetDefault(MultiTenancy, false)
 	config.Config.SetDefault(MultiTenancyScopeAPIGroup, "")
 	config.Config.SetDefault(MultiTenancyScopeResource, "pods")
@@ -90,7 +86,7 @@ func FullKeyPath(key string) string {
 func isRootKey(key string) bool {
 	switch key {
 	case EventsBufferLengthKey, ContainerdSocketPath, CrioSocketPath, DockerSocketPath,
-		PodmanSocketPath, GadgetNamespace, DaemonLogLevel, KubeletCABundle, KubeletServerName, MultiTenancy,
+		PodmanSocketPath, GadgetNamespace, DaemonLogLevel, MultiTenancy,
 		MultiTenancyScopeAPIGroup, MultiTenancyScopeResource, MultiTenancyScopeVerb:
 		return true
 	default:
