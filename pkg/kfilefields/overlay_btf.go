@@ -20,7 +20,7 @@ import (
 	"io/fs"
 	"strings"
 
-	"github.com/moby/moby/pkg/parsers/kernel"
+	"github.com/inspektor-gadget/inspektor-gadget/internal/testing/kernel"
 )
 
 // checkOverlayModuleBTF diagnoses missing BTF for a loaded overlay module.

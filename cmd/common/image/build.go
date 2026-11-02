@@ -34,7 +34,7 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/moby/moby/pkg/jsonmessage"
+	"github.com/moby/moby/client/pkg/jsonmessage"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
